@@ -1,0 +1,45 @@
+# ============================================================
+# Recon Framework - Configuration
+# ============================================================
+
+# Default configuration
+declare -A CONFIG=(
+    # Directories
+    [CACHE_DIR]="${HOME}/.cache/recon"
+    [WORDLISTS_DIR]="${HOME}/wordlists"
+
+    # Timeouts (seconds)
+    [DEFAULT_TIMEOUT]=15
+    [FAST_TIMEOUT]=8
+    [SLOW_TIMEOUT]=30
+
+    # Thread counts
+    [FFUF_THREADS]=100
+    [HTTPX_THREADS]=50
+    [NUCLEI_THREADS]=25
+
+    # Wordlist URLs for auto-download
+    [DNS_WORDLIST_URL]="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-5000.txt"
+    [DIR_WORDLIST_URL]="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt"
+
+    # CDN providers for origin bypass
+    [CLOUDFLARE_IPS]="https://www.cloudflare.com/ips-v4"
+    [FASTLY_IPS]="https://api.fastly.com/public-ip-list"
+    [AWS_RANGES]="https://ip-ranges.amazonaws.com/ip-ranges.json"
+)
+
+# Security headers that should be present
+readonly SECURITY_HEADERS=(
+    "Strict-Transport-Security"
+    "X-Frame-Options"
+    "X-Content-Type-Options"
+    "Content-Security-Policy"
+    "Referrer-Policy"
+    "Permissions-Policy"
+)
+
+# Sensitive parameter names for detection
+readonly SENSITIVE_PARAMS=(
+    "password" "passwd" "pwd" "token" "secret" "api_key" "apikey"
+    "access_token" "private_key" "ssn" "credit" "card" "cvv" "account_no"
+)

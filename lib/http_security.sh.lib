@@ -1,0 +1,174 @@
+# ============================================================
+# Recon Framework - HTTP Security Module
+# ============================================================
+
+http_security_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local sec_dir="$output_dir/security_headers"
+    local fuzz_out="$output_dir/fuzz_results"
+
+    mkdir -p "$sec_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    # ─── Security Headers Analysis ──────────────────────────────
+    log_info "Analyzing HTTP security headers..."
+    local full_headers
+    full_headers=$(curl -sk -I --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" 2>/dev/null)
+    echo "$full_headers" > "$sec_dir/response_headers.txt"
+
+    : > "$sec_dir/missing_headers.txt"
+    : > "$sec_dir/present_headers.txt"
+
+    for header in "${SECURITY_HEADERS[@]}"; do
+        if echo "$full_headers" | grep -qi "^${header}:"; then
+            local val
+            val=$(echo "$full_headers" | grep -i "^${header}:" | head -1 | tr -d '\r')
+            echo "[PRESENT] $val" >> "$sec_dir/present_headers.txt"
+        else
+            echo "[MISSING] $header" >> "$sec_dir/missing_headers.txt"
+            log_info "Security header missing (best-practice, low severity): $header"
+        fi
+    done
+
+    local missing_count
+    missing_count=$(safe_count "$sec_dir/missing_headers.txt")
+    log_ok "Missing security headers: $missing_count"
+
+    # ─── HTTP OPTIONS Method ──────────────────────────────────
+    log_info "Testing HTTP OPTIONS method..."
+    local options_file="$sec_dir/http_options.txt"
+    : > "$options_file"
+
+    for option_url in "$base_url" "$base_url/login"; do
+        local opts
+        opts=$(curl -sk -X OPTIONS -o /dev/null -D - --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$option_url" 2>/dev/null)
+        local allowed
+        allowed=$(echo "$opts" | grep -i '^Allow:\|^Access-Control-Allow-Methods:' | head -1 | tr -d '\r')
+        # OPTIONS/Allow being present is normal; only note it, and only flag if a
+        # dangerous method is advertised.
+        if [[ -n "$allowed" ]]; then
+            echo "[OPTIONS] $option_url -> $allowed" >> "$options_file"
+            echo "$allowed" | grep -qiE '\b(PUT|DELETE|TRACE|CONNECT|PATCH)\b' \
+                && log_warn "Potentially dangerous methods allowed: $allowed" \
+                || log_info "OPTIONS methods: $allowed"
+        fi
+    done
+
+    # ─── Host Header Injection ──────────────────────────────────
+    log_info "Testing Host header injection..."
+    local host_header_file="$sec_dir/host_header.txt"
+    : > "$host_header_file"
+
+    local evil_host="evil-attacker-control.test"
+    for variant in "Host: ${evil_host}" "X-Forwarded-Host: ${evil_host}" \
+                   "Host: ${evil_host}\nX-Forwarded-Scheme: https"; do
+        local resp
+        resp=$(curl -sk -D - --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -H "$variant" "$base_url" 2>/dev/null)
+        if echo "$resp" | grep -qiE "https?://${evil_host}|href.*//${evil_host}|location:.*${evil_host}" | grep -qi "$evil_host"; then
+            echo "[HOST-HEADER] reflected '${evil_host}' via [${variant%%:*}]: $resp" >> "$host_header_file"
+            log_vuln "Host header injection via ${variant%%:*}"
+        fi
+    done
+
+    # ─── Sensitive Data in GET Parameters ──────────────────────
+    log_info "Checking for sensitive data in GET parameters..."
+    local sensitive_get="$sec_dir/sensitive_get.txt"
+    local param_urls="$fuzz_out/urls_with_params.txt"
+
+    : > "$sensitive_get"
+    if [[ -s "$param_urls" ]]; then
+        for param in "${SENSITIVE_PARAMS[@]}"; do
+            grep -iE "[?&]${param}=" "$param_urls" 2>/dev/null >> "$sensitive_get"
+        done
+        sort -u "$sensitive_get" -o "$sensitive_get"
+    fi
+
+    local sens_hits
+    sens_hits=$(safe_count "$sensitive_get")
+    # A sensitively-named parameter is worth reviewing but is not itself a vuln.
+    [[ "$sens_hits" -gt 0 ]] && log_info "Sensitively-named GET parameters to review: $sens_hits"
+
+    # ─── CORS Misconfiguration ────────────────────────────────
+    log_info "Testing CORS misconfiguration..."
+    local cors_file="$sec_dir/cors.txt"
+    : > "$cors_file"
+
+    local cors_targets
+    cors_targets=$(mktemp)
+    {
+        [[ -f "$output_dir/live_hosts.txt" ]] && cat "$output_dir/live_hosts.txt"
+        echo "$base_url"
+    } | sort -u | head -20 > "$cors_targets"
+
+    while read -r turl; do
+        [[ -z "$turl" ]] && continue
+        local hdrs
+        hdrs=$(curl -sk -o /dev/null -D - --max-time 6 \
+            -H "Origin: https://evil.${evil_host}" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" 2>/dev/null | tr -d '\r')
+        local acao
+        acao=$(echo "$hdrs" | grep -i '^access-control-allow-origin:' | head -1)
+        local acac
+        acac=$(echo "$hdrs" | grep -i '^access-control-allow-credentials:.*true' | head -1)
+
+        # A plain "ACAO: *" (no credentials) is normal and NOT a vuln. Only two cases
+        # are real: (a) the server reflects our attacker origin, or (b) wildcard WITH
+        # credentials (which browsers block anyway, but still a misconfig to report).
+        if echo "$acao" | grep -qiE "evil\.${evil_host}"; then
+            local severity="reflects attacker origin"
+            [[ -n "$acac" ]] && severity="reflects attacker origin + credentials (HIGH)"
+            echo "[CORS] $turl -> $acao ${acac:+(+creds)} [$severity]" >> "$cors_file"
+            record_finding "cors" "high" "CONFIRMED" "$turl" "$severity"
+        elif echo "$acao" | grep -qE '\*' && [[ -n "$acac" ]]; then
+            echo "[CORS] $turl -> wildcard ACAO with credentials" >> "$cors_file"
+            record_finding "cors" "high" "CONFIRMED" "$turl" "wildcard ACAO with credentials"
+        fi
+    done < "$cors_targets"
+
+    rm -f "$cors_targets"
+
+    echo "$sec_dir"
+}
+
+# CRLF Injection test
+crlf_injection() {
+    local target="$1"
+    local output_dir="$2"
+    local crlf_file="$output_dir/security_headers/crlf_injection.txt"
+
+    [[ -f "$output_dir/fuzz_results/urls_with_params.txt" ]] || return
+
+    : > "$crlf_file"
+    log_info "Testing CRLF injection..."
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    local crlf_payload="%0d%0aX-CRLF-Test:%20injected"
+
+    head -20 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=${crlf_payload}") || new_pairs+=("${pairs[$j]}")
+            done
+
+            local fuzz_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+            local resp_hdrs
+            resp_hdrs=$(curl -sk -D - -o /dev/null --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$fuzz_url" 2>/dev/null)
+
+            if echo "$resp_hdrs" | grep -qi "^X-CRLF-Test:"; then
+                echo "[CRLF] param=$key -> ${fuzz_url}" >> "$crlf_file"
+                log_vuln "CRLF injection via param '$key'"
+            fi
+        done
+    done
+}

@@ -1,0 +1,234 @@
+# ============================================================
+# Recon Framework - Port Scanning Module
+# ============================================================
+
+
+
+# Verify server type matches vulnerability (prevents Apache vulns on nginx)
+verify_vuln_server_type() {
+    local nmap_out="$1"
+    local vuln_name="$2"
+    
+    # Get actual server type from nmap output
+    local server_type
+    server_type=$(grep -i "http-server-header:" "$nmap_out" 2>/dev/null | head -1 | grep -oiE "nginx|apache|iis|tomcat|lighttpd" || echo "unknown")
+    
+    # Check if vulnerability matches server type
+    case "$vuln_name" in
+        *apache*|*CVE-2011-3192*|*byterange*)
+            [[ "$server_type" == "apache" ]] && return 0 || return 1 ;;
+        *iis*|*aspnet*)
+            [[ "$server_type" == "iis" ]] && return 0 || return 1 ;;
+        *nginx*)
+            [[ "$server_type" == "nginx" ]] && return 0 || return 1 ;;
+        *)
+            return 0 ;;  # Unknown vuln, allow it
+    esac
+}
+
+filter_spoofed_ports() {
+    local ports="$1"
+    local count
+    count=$(echo "$ports" | tr ',' '\n' | grep -v '^$' | wc -l)
+    if [[ "$count" -gt 30 ]]; then
+        log_warn "Host has $count open ports. This is highly indicative of port-spoofing (firewall/CDN)."
+        log_info "Filtering to standard common ports to prevent false positives and speed up the scan."
+        local filtered=""
+        for p in ${ports//,/ }; do
+            if [[ ",21,22,23,25,53,80,110,135,139,143,443,445,1433,1521,3306,3389,5432,8080,8443,9000,9443," == *",$p,"* ]]; then
+                filtered="${filtered:+$filtered,}$p"
+            fi
+        done
+        [[ -z "$filtered" ]] && filtered="80,443"
+        echo "$filtered"
+    else
+        echo "$ports"
+    fi
+}
+
+port_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local open_ports_file="$output_dir/open_ports.txt"
+    local nmap_out="$output_dir/nmap_initial.txt"
+
+    # Priority: confirmed origin IP > candidate origin IPs > domain name
+    local scan_host="${REAL_IP:-}"
+    local scan_label="domain"
+
+    if [[ -n "$scan_host" ]]; then
+        scan_label="confirmed origin"
+        log_info "Scanning confirmed origin IP: $scan_host"
+    else
+        # Try to use candidate IPs discovered in Step 0 (avoids CDN IP scanning)
+        local candidates_file="$output_dir/.all_discovered_ips.tmp"
+        local candidate_ip=""
+        if [[ -s "$candidates_file" ]]; then
+            # Get first non-CDN, non-mail candidate IP
+            candidate_ip=$(grep '|candidate|' "$candidates_file" 2>/dev/null | \
+                head -1 | cut -d'|' -f1 || true)
+        fi
+
+        if [[ -n "$candidate_ip" ]]; then
+            scan_host="$candidate_ip"
+            scan_label="candidate origin (CDN bypass)"
+            log_warn "No confirmed origin IP. Using best candidate: $scan_host"
+            log_info "Nmap will use --resolve-hosts off + direct IP scan to bypass CDN"
+        else
+            scan_host="$target"
+            scan_label="domain (may hit CDN)"
+            log_warn "No candidate origin IPs found. Scanning domain directly (may hit CDN)"
+        fi
+    fi
+
+    log_info "Scan target: $scan_host ($scan_label)"
+
+    # Naabu: fast port discovery
+    local open_ports=""
+    if check_tool naabu; then
+        log_info "Running naabu fast port discovery..."
+        local naabu_out="$output_dir/naabu_ports.txt"
+        local naabu_ports=("-top-ports" "1000")
+        [[ "${FORCE_FULLSCAN:-0}" -eq 1 ]] && naabu_ports=("-p" "-")
+
+        naabu -host "$scan_host" "${naabu_ports[@]}" -silent -o "$naabu_out" 2>/dev/null || true
+        open_ports=$(grep -oE ':[0-9]+$' "$naabu_out" 2>/dev/null | tr -d ':' | sort -un | paste -sd',' || true)
+        [[ -n "$open_ports" ]] && log_ok "naabu open ports: $open_ports"
+    fi
+
+    # Masscan: ultra-fast full port scan
+    if [[ -z "$open_ports" ]] && [[ "${FORCE_FULLSCAN:-0}" -eq 2 ]] && check_tool masscan; then
+        log_info "Running masscan ultra-fast 65535-port scan..."
+        local masscan_out="$output_dir/masscan_ports.txt"
+        masscan -p1-65535 "$scan_host" --rate=10000 -oL "$masscan_out" 2>/dev/null || true
+        open_ports=$(awk '$3=="open"{print $4}' "$masscan_out" 2>/dev/null | sort -un | paste -sd',' || true)
+        [[ -n "$open_ports" ]] && log_ok "masscan open ports: $open_ports"
+    fi
+
+    # Nmap service version + scripts
+    if [[ -n "$open_ports" ]]; then
+        open_ports=$(filter_spoofed_ports "$open_ports")
+        log_info "Running nmap -sV -sC on discovered ports..."
+        nmap -sV -sC -Pn "$(get_nmap_timing)" --open -p "$open_ports" "$scan_host" -oN "$nmap_out" 2>/dev/null || true
+    else
+        log_info "Running nmap top 1000 ports (with -Pn to bypass ICMP block)..."
+        nmap -sV -sC "$(get_nmap_timing)" --open -Pn "$scan_host" -oN "$nmap_out" 2>/dev/null || true
+        open_ports=$(grep "^[0-9]" "$nmap_out" 2>/dev/null | grep "open" | awk '{print $1}' | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//' || true)
+        if [[ -n "$open_ports" ]]; then
+            open_ports=$(filter_spoofed_ports "$open_ports")
+        fi
+    fi
+
+    # Fallback: scan all candidate IPs if still no ports found
+    if [[ -z "$open_ports" ]]; then
+        log_warn "No ports found on primary target. Trying all candidate origin IPs..."
+        local candidates_file="$output_dir/.all_discovered_ips.tmp"
+        if [[ -s "$candidates_file" ]]; then
+            while IFS='|' read -r ip source detail class; do
+                [[ "$class" == "cdn" || "$class" == "mail" || -z "$ip" ]] && continue
+                # Skip nameserver IPs (NS/SOA records) - they are not web servers
+                [[ "$source" == *"NS"* || "$source" == *"SOA"* ]] && { log_info "Skipping nameserver IP: $ip ($source)"; continue; }
+                log_info "Trying candidate: $ip ($source)"
+                local cand_nmap="$output_dir/nmap_cand_${ip//./_}.txt"
+                nmap -sV -sC -Pn "$(get_nmap_timing)" --open "$ip" -oN "$cand_nmap" 2>/dev/null || true
+                local cand_ports
+                cand_ports=$(grep "^[0-9]" "$cand_nmap" 2>/dev/null | grep "open" | awk '{print $1}' | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//' || true)
+                if [[ -n "$cand_ports" ]]; then
+                    log_ok "Found open ports on $ip: $cand_ports"
+                    open_ports="$cand_ports"
+                    scan_host="$ip"
+                    nmap_out="$cand_nmap"
+                    # Update REAL_IP globally so downstream steps use this IP
+                    REAL_IP="$ip"
+                    log_ok "Setting origin IP to $ip for downstream steps"
+                    break
+                fi
+            done < "$candidates_file"
+        fi
+    fi
+
+    # Curl fallback: if nmap found nothing, try direct curl to common web ports
+    if [[ -z "$open_ports" ]]; then
+        log_info "Nmap found no open ports. Testing common web ports with curl..."
+        for port in 443 80 8080 8443; do
+            local proto="https"
+            [[ "$port" == "80" || "$port" == "8080" ]] && proto="http"
+            local curl_code
+            curl_code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${proto}://${scan_host}:${port}/" 2>/dev/null || echo "000")
+            if [[ "$curl_code" != "000" && "$curl_code" != "000000" ]]; then
+                open_ports="$port"
+                log_ok "Curl found open port $port (HTTP $curl_code)"
+                break
+            fi
+        done
+    fi
+
+    # Full scan if forced and still nothing
+    if [[ -z "$open_ports" ]] && [[ "${FORCE_FULLSCAN:-0}" -eq 1 ]]; then
+        log_info "Running full 65535-port scan (-f flag)..."
+        local nmap_full="$output_dir/nmap_fullscan.txt"
+        nmap -sV -p- "$(get_nmap_timing)" --open -Pn "$scan_host" -oN "$nmap_full" 2>/dev/null || true
+        open_ports=$(grep "^[0-9]" "$nmap_full" 2>/dev/null | grep "open" | awk '{print $1}' | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//' || true)
+        nmap_out="$nmap_full"
+    fi
+
+    [[ -n "$open_ports" ]] && echo "$open_ports" > "$open_ports_file"
+
+    if [[ -n "$open_ports" ]]; then
+        log_ok "Open ports: $open_ports"
+        grep "^[0-9]" "$nmap_out" 2>/dev/null | grep "open" | while read -r line; do
+            echo -e "    ${GREEN}▶ $line${NC}"
+        done
+
+        # Run vulnerability scripts
+        log_info "Running nmap vuln scripts on open ports..."
+        local nmap_vuln_out="$output_dir/nmap_vulns.txt"
+        timeout 120 nmap -sV --script vuln -p "$open_ports" -Pn "$(get_nmap_timing)" "$scan_host" -oN "$nmap_vuln_out" 2>/dev/null || true
+        # Count only genuine VULNERABLE state blocks; ignore script errors/failures
+        # which previously caused false-positive CVE counts.
+        local conf_count=$(grep -c \'State:.*VULNERABLE\' "$nmap_vuln_out" 2>/dev/null || echo 0)
+        conf_count=$(echo "$conf_count" | tr -dc '0-9')
+        [[ -z "$conf_count" ]] && conf_count=0
+        local likely_count=$(grep -c \'State:.*LIKELY\' "$nmap_vuln_out" 2>/dev/null || echo 0)
+        likely_count=$(echo "$likely_count" | tr -dc '0-9')
+        [[ -z "$likely_count" ]] && likely_count=0
+        if [[ "$conf_count" -gt 0 ]]; then
+            log_vuln "CVEs flagged by nmap ($conf_count) → $nmap_vuln_out"
+            # Verify each vulnerability against actual server type
+            grep -B2 -A4 "State:.*VULNERABLE" "$nmap_vuln_out" 2>/dev/null | while read -r line; do
+                if echo "$line" | grep -qiE "CVE-|vuln-"; then
+                    local vuln_name
+                    vuln_name=$(echo "$line" | grep -oiE "CVE-[0-9]+-[0-9]+|vuln-[a-z0-9-]+" | head -1)
+                    if [[ -n "$vuln_name" ]]; then
+                        if verify_vuln_server_type "$nmap_vuln_out" "$vuln_name"; then
+                            echo "  [CONFIRMED] $vuln_name (server type matches)"
+                        else
+                            echo "  [FALSE POSITIVE] $vuln_name (server type mismatch)"
+                        fi
+                    fi
+                fi
+            done | head -20
+        elif [[ "$likely_count" -gt 0 ]]; then
+            log_warn "LIKELY VULNERABLE ($likely_count) - verify manually (false positives common on CDNs)"
+        else
+            log_ok "No obvious CVEs detected by nmap scripts."
+        fi
+    else
+        log_warn "No open ports found on any candidate. Try -f flag for full scan."
+    fi
+}
+
+# Get web ports from open ports
+get_web_ports() {
+    local open_ports="$1"
+    local web_ports=""
+
+    for port in ${open_ports//,/ }; do
+        case "$port" in
+            80|81|443|8080|8443|9000|9001|3000|8888|3001|4000|5000|8000|8888|9443)
+                web_ports="${web_ports}${port} " ;;
+        esac
+    done
+
+    echo "$web_ports"
+}

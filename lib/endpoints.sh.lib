@@ -1,0 +1,126 @@
+# ============================================================
+# Recon Framework - Endpoint Discovery Module
+# ============================================================
+
+endpoint_discovery() {
+    local target="$1"
+    local output_dir="$2"
+    local endpoints_out="$output_dir/endpoints"
+
+    mkdir -p "$endpoints_out"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="http://$target"
+
+    # ─── Katana crawling ────────────────────────────────────────
+    if check_tool katana; then
+        log_info "Running katana headless crawler on web ports..."
+
+        local web_ports="80 443 8080 8443 9000 3000 8888 9001 3001 4000 5000 8000 9443"
+        local open_ports=""
+
+        [[ -f "$output_dir/open_ports.txt" ]] && open_ports=$(cat "$output_dir/open_ports.txt")
+        
+        # If no open ports found, only crawl 80 and 443 (not all 13 ports)
+        if [[ -z "$open_ports" ]]; then
+            open_ports="80,443"
+            log_info "No open ports file found, crawling only ports 80 and 443"
+        fi
+
+        for port in $web_ports; do
+            ! echo ",$open_ports," | grep -q ",$port," && continue
+
+            local proto
+            [[ "$port" == "443" || "$port" == "8443" || "$port" == "9000" || "$port" == "81" || "$port" == "9443" ]] && proto="https" || proto="http"
+
+            log_info "Crawling ${proto}://${target}:${port}"
+            katana -u "${proto}://${target}:${port}" -jc -kf all \
+                ${HDR_H[@]+"${HDR_H[@]}"} -o "$endpoints_out/katana_${port}.txt" -silent 2>/dev/null || true
+
+            [[ -s "$endpoints_out/katana_${port}.txt" ]] && \
+                log_ok "Port $port: $(wc -l < "$endpoints_out/katana_${port}.txt") endpoints"
+        done
+
+        cat "$endpoints_out"/katana_*.txt 2>/dev/null | sort -u > "$endpoints_out/katana_endpoints.txt"
+        log_ok "Katana total: $(safe_count "$endpoints_out/katana_endpoints.txt") endpoints"
+    fi
+
+    # ─── gau historical URLs ───────────────────────────────────
+    if check_tool gau; then
+        log_info "Running gau (Wayback/ CommonCrawl/ OTX/ URLScan)..."
+        gau --subs "$target" --o "$endpoints_out/gau_urls.txt" 2>/dev/null || true
+        log_ok "gau found $(safe_count "$endpoints_out/gau_urls.txt") historical URLs"
+    fi
+
+    # ─── Combine endpoints ─────────────────────────────────────
+    local combined="$endpoints_out/all_endpoints.txt"
+    cat "$endpoints_out"/*.txt 2>/dev/null | sort -u > "$combined"
+    log_ok "Total endpoints: $(wc -l < "$combined")"
+}
+
+extract_js_files() {
+    local endpoints_file="$1"
+    local output_file="$2"
+
+    grep -iE '\.js(\?|$|&)' "$endpoints_file" 2>/dev/null | head -200 > "$output_file"
+}
+# ── Active parameter discovery (arjun + x8) — v11.2 ──
+# arjun was previously declared but never used. x8 (Rust) is added as a
+# higher-accuracy complement. Both are optional; skipped if not installed.
+# Global timeout for param_discovery
+param_discovery() {
+    local target="$1" output_dir="$2"
+    local pd_dir="$output_dir/param_discovery"; mkdir -p "$pd_dir"
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    local live="$pd_dir/targets.txt"
+    # Prefer live crawled endpoints; fall back to the base target.
+    if [[ -s "$endpoints_file" ]]; then
+        grep -E '^https?://' "$endpoints_file" 2>/dev/null | sort -u | head -50 > "$live"
+    else
+        echo "$target" > "$live"
+    fi
+    : > "$pd_dir/discovered_params.txt"
+
+    if check_tool arjun; then
+        log_info "Parameter discovery with arjun (max 30 URLs, 60s timeout)..."
+        # Limit URLs for arjun to prevent timeout
+        local arjun_input="$pd_dir/arjun_targets.txt"
+        head -30 "$live" > "$arjun_input" 2>/dev/null || true
+        [[ -s "$arjun_input" ]] || echo "$target" > "$arjun_input"
+        local arjun_args=(-i "$arjun_input" -oT "$pd_dir/arjun_out.txt" -m GET --timeout 10)
+        # Pass auth cookie/headers if the scan is authenticated.
+        [[ -n "${COOKIE:-}" ]] && arjun_args+=(--cookie "$COOKIE")
+        timeout 60 arjun "${arjun_args[@]}" >/dev/null 2>&1 || log_warn "arjun timed out or failed"
+        [[ -f "$pd_dir/arjun_out.txt" ]] && cat "$pd_dir/arjun_out.txt" >> "$pd_dir/discovered_params.txt" 2>/dev/null || true
+    fi
+
+    if check_tool x8; then
+        log_info "Parameter discovery with x8 (high-accuracy, max 10 URLs, 15s timeout)..."
+        local wl="${CONFIG[WORDLISTS_DIR]:-/tmp}/params.txt"
+        [[ -s "$wl" ]] || wl=""   # x8 ships a default if none given
+        local x8_count=0
+        while read -r u; do
+            [[ -z "$u" ]] && continue
+            [[ $x8_count -ge 10 ]] && break
+            if [[ -n "$wl" ]]; then
+                timeout 15 x8 -u "$u" -w "$wl" -o "$pd_dir/x8_out.txt" --append 2>/dev/null || true
+            else
+                timeout 15 x8 -u "$u" -o "$pd_dir/x8_out.txt" --append 2>/dev/null || true
+            fi
+            x8_count=$((x8_count + 1))
+        done < <(head -10 "$live")
+        [[ -f "$pd_dir/x8_out.txt" ]] && grep -oE 'https?://[^ ]+\?[^ ]+' "$pd_dir/x8_out.txt" 2>/dev/null >> "$pd_dir/discovered_params.txt" || true
+    fi
+
+    # Merge newly discovered parameterised URLs into the shared fuzz list so the
+    # injection checks (XSS/SSTI/SQLi/etc.) test them too.
+    if [[ -s "$pd_dir/discovered_params.txt" ]]; then
+        local fuzz="$output_dir/fuzz_results/urls_with_params.txt"
+        mkdir -p "$output_dir/fuzz_results"; touch "$fuzz"
+        grep -E '\?[^=]+=' "$pd_dir/discovered_params.txt" 2>/dev/null >> "$fuzz" || true
+        sort -u "$fuzz" -o "$fuzz"
+        log_ok "Parameter discovery merged $(safe_count "$pd_dir/discovered_params.txt") candidates into fuzz list"
+    else
+        log_info "Parameter discovery: install arjun and/or x8 for hidden-parameter mining"
+    fi
+}

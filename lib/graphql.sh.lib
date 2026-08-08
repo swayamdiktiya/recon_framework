@@ -1,0 +1,142 @@
+# ============================================================
+# Recon Framework - GraphQL Discovery Module
+# ============================================================
+
+graphql_discovery() {
+    local target="$1"
+    local output_dir="$2"
+    local gql_dir="$output_dir/graphql"
+
+    mkdir -p "$gql_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Probing common GraphQL paths..."
+    : > "$gql_dir/graphql_endpoints.txt"
+
+    local gql_paths="/graphql /gql /api/graphql /query /v1/graphql /v2/graphql /v3/graphql /graphql.php /api/gql /graphql-console"
+
+    for path in $gql_paths; do
+        # A status code alone (400/403 happen everywhere) is not evidence. Send a
+        # minimal GraphQL query and require a GraphQL-shaped JSON response.
+        local probe
+        probe=$(curl -skg --max-time 5 -H "Content-Type: application/json" \
+            -d '{"query":"{__typename}"}' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}${path}" 2>/dev/null)
+        if echo "$probe" | grep -qE '"data"[[:space:]]*:[[:space:]]*\{[^}]*__typename|"errors"[[:space:]]*:.*("message"|GRAPHQL_|Cannot query|must be)|__typename'; then
+            echo "[GRAPHQL] ${base_url}${path}" >> "$gql_dir/graphql_endpoints.txt"
+        fi
+    done
+
+    # Check from crawled endpoints
+    [[ -f "$output_dir/endpoints/all_endpoints.txt" ]] && \
+        grep -iE '/graphql|/gql|/query|/v[0-9]+/graphql' "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null >> "$gql_dir/graphql_endpoints.txt" || true
+
+    sort -u "$gql_dir/graphql_endpoints.txt" -o "$gql_dir/graphql_endpoints.txt"
+
+    local gql_count
+    gql_count=$(safe_count "$gql_dir/graphql_endpoints.txt")
+
+    if [[ "$gql_count" -gt 0 ]]; then
+        log_ok "GraphQL endpoints confirmed: $gql_count"
+        cat "$gql_dir/graphql_endpoints.txt"
+
+        # Test introspection
+        log_info "Testing GraphQL introspection..."
+        : > "$gql_dir/introspection.txt"
+
+        while read -r gql_ep; do
+            [[ -z "$gql_ep" ]] && continue
+            local ep
+            ep=$(echo "$gql_ep" | grep -oE 'https?://[^ ]+' || true)
+
+            local resp
+            resp=$(curl -sk --max-time 10 -H "Content-Type: application/json" \
+                -d '{"query":"{__schema{types{name}}}"}' ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" 2>/dev/null || true)
+
+            if echo "$resp" | grep -q '__schema'; then
+                echo "[INTROSPECTION OPEN] $ep - exposes __schema" >> "$gql_dir/introspection.txt"
+                log_vuln "GraphQL introspection enabled: $ep"
+            fi
+        done < "$gql_dir/graphql_endpoints.txt"
+    else
+        log_ok "No GraphQL endpoints detected"
+    fi
+}
+# ─── GraphQL Security Deep Check ─────────────────────────────────
+graphql_security_check() {
+    local target="$1"
+    local output_dir="$2"
+    local gql_dir="$output_dir/graphql"
+
+    mkdir -p "$gql_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Running GraphQL security deep checks..."
+
+    # Build endpoint list
+    [[ -f "$gql_dir/graphql_endpoints.txt" ]] && cat "$gql_dir/graphql_endpoints.txt" | grep -oE 'https?://[^ ]+' > "$gql_dir/endpoints.txt" 2>/dev/null || true
+
+    # Also check root URL
+    for path in /graphql /gql /query; do
+        if curl -sk -o /dev/null -w "%{http_code}" --max-time 3 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}${path}" 2>/dev/null | grep -qE '^(200|400|403|405)$'; then
+            [[ -f "$gql_dir/endpoints.txt" ]] && grep -qFx "${base_url}${path}" "$gql_dir/endpoints.txt" || echo "${base_url}${path}" >> "$gql_dir/endpoints.txt"
+        fi
+    done
+
+    [[ ! -s "$gql_dir/endpoints.txt" ]] && { log_info "No GraphQL endpoints found"; return; }
+
+    : > "$gql_dir/depth_dos.txt"
+    : > "$gql_dir/batching.txt"
+    : > "$gql_dir/field_duplication.txt"
+
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+
+        # 1. Query depth limit test
+        log_info "Testing query depth on $endpoint..."
+        local deep_query='{"query":"query{category{name{category{name{category{name{category{name{__typename}}}}}}}}"}'
+        local resp
+        resp=$(curl -sk --max-time 10 -H "Content-Type: application/json" -d "$deep_query" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+
+        if echo "$resp" | grep -qE 'syntax|depth|nested|limit|exceeded'; then
+            echo "[DEPTH LIMIT] $endpoint has query depth protection" >> "$gql_dir/depth_dos.txt"
+        elif echo "$resp" | grep -qE '__typename'; then
+            echo "[NO DEPTH LIMIT] $endpoint accepts deep queries - DoS risk!" >> "$gql_dir/depth_dos.txt"
+            log_vuln "GraphQL endpoint has no query depth limit: $endpoint"
+        fi
+
+        # 2. Field duplication test
+        log_info "Testing field duplication..."
+        local dup_query='{"query":"mutation{resetPassword(email:\"a@a.com\",email:\"b@b.com\"){__typename}}"}'
+        resp=$(curl -sk --max-time 10 -H "Content-Type: application/json" -d "$dup_query" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+
+        # A spec-compliant server rejects duplicate fields with a GraphQL validation
+        # error. Only a genuine "data" response (no errors) to the duplicate-field
+        # query suggests it was accepted — and that's a manual-review note, not a vuln.
+        if echo "$resp" | grep -qiE '"errors"|duplicate|can only be defined once|already exists'; then
+            echo "[FIELD DUPLICATION] Server rejects duplicate fields (good)" >> "$gql_dir/field_duplication.txt"
+        elif echo "$resp" | grep -qE '"data"[[:space:]]*:[[:space:]]*\{' && ! echo "$resp" | grep -qi '"errors"'; then
+            echo "[REVIEW] Server returned data for a duplicate-field query — verify manually" >> "$gql_dir/field_duplication.txt"
+        fi
+
+        # 3. Batching (multiple queries)
+        log_info "Testing query batching..."
+        local batch='[{"query":"{__schema{types{name}}}"},{"query":"{__schema{types{name}}}"},{"query":"{__schema{types{name}}}"}]'
+        resp=$(curl -sk --max-time 10 -H "Content-Type: application/json" -d "$batch" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+
+        if echo "$resp" | grep -q '\[' && echo "$resp" | grep -qcE '__schema'; then
+            echo "[BATCHING ENABLED] $endpoint accepts batched queries" >> "$gql_dir/batching.txt"
+            log_vuln "GraphQL batching enabled on $endpoint - DoS risk"
+        fi
+    done < "$gql_dir/endpoints.txt"
+
+    local depth_issues batch_issues
+    depth_issues=$(safe_count "$gql_dir/depth_dos.txt")
+    batch_issues=$(safe_count "$gql_dir/batching.txt")
+
+    [[ "$depth_issues" -gt 0 ]] && log_vuln "GraphQL depth issues: $depth_issues"
+    [[ "$batch_issues" -gt 0 ]] && log_vuln "GraphQL batching issues: $batch_issues"
+}

@@ -1,0 +1,574 @@
+# ============================================================
+# Recon Framework - CDN/Origin Bypass Module
+# ============================================================
+
+cdn_bypass_init() {
+    mkdir -p "${CONFIG[CACHE_DIR]}"
+}
+
+fetch_cdn_ranges() {
+    local ranges_file="${CONFIG[CACHE_DIR]}/cdn_ranges.txt"
+
+    # Return cached ranges if fresh (within 24 h)
+    if [[ -s "$ranges_file" ]] && [[ -n "$(find "$ranges_file" -mtime -1 2>/dev/null)" ]]; then
+        echo "$ranges_file"
+        return 0
+    fi
+
+    : > "$ranges_file"
+
+    # ── Cloudflare (official IPv4 + IPv6) ────────────────────────
+    curl -s --max-time 10 https://www.cloudflare.com/ips-v4 2>/dev/null >> "$ranges_file" || true
+    curl -s --max-time 10 https://www.cloudflare.com/ips-v6 2>/dev/null >> "$ranges_file" || true
+
+    # ── Fastly public IPs ─────────────────────────────────────────
+    curl -s --max-time 10 https://api.fastly.com/public-ip-list 2>/dev/null | \
+        grep -oE '"[0-9a-fA-F:.]+/[0-9]+"' | tr -d '"' >> "$ranges_file" || true
+
+    # ── AWS CloudFront ────────────────────────────────────────────
+    curl -s --max-time 10 https://ip-ranges.amazonaws.com/ip-ranges.json 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for p in data.get('prefixes', []):
+        if p.get('service') == 'CLOUDFRONT':
+            print(p['ip_prefix'])
+    for p in data.get('ipv6_prefixes', []):
+        if p.get('service') == 'CLOUDFRONT':
+            print(p['ipv6_prefix'])
+except: pass
+" >> "$ranges_file" || true
+
+    # ── Akamai (well-known netblocks; authoritative list needs account) ──
+    # Hardcoded major Akamai CIDR blocks (publicly documented)
+    cat >> "$ranges_file" << 'AKAMAI'
+23.0.0.0/12
+23.32.0.0/11
+23.64.0.0/14
+23.192.0.0/11
+2.16.0.0/13
+2.22.0.0/15
+2.18.0.0/15
+104.64.0.0/10
+AKAMAI
+
+    # ── Sucuri / GoDaddy WAF ──────────────────────────────────────
+    cat >> "$ranges_file" << 'SUCURI'
+192.88.134.0/23
+185.93.228.0/22
+194.124.199.0/24
+SUCURI
+
+    # ── Imperva / Incapsula ───────────────────────────────────────
+    curl -s --max-time 10 \
+        "https://my.imperva.com/api/integration/v1/cidr/ips" 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' >> "$ranges_file" || true
+    # Fallback hardcoded Imperva ranges
+    cat >> "$ranges_file" << 'IMPERVA'
+199.83.128.0/21
+198.143.32.0/19
+149.126.72.0/21
+103.28.248.0/22
+45.64.64.0/22
+185.11.124.0/22
+192.230.64.0/18
+IMPERVA
+
+    # ── BunnyCDN ─────────────────────────────────────────────────
+    cat >> "$ranges_file" << 'BUNNY'
+185.152.66.0/24
+185.152.67.0/24
+BUNNY
+
+    # ── Azure CDN (Front Door) ────────────────────────────────────
+    curl -s --max-time 10 \
+        "https://www.microsoft.com/en-us/download/confirmation.aspx?id=56519" 2>/dev/null | \
+        grep -oE 'ServiceTags_Public_[0-9]+\.json' | head -1 | \
+        xargs -I{} curl -s --max-time 20 "https://download.microsoft.com/download/7/1/D/71D86715-5596-4529-9B13-DA13A5DE5B63/{}" 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    for v in json.load(sys.stdin).get('values', []):
+        if 'AzureFrontDoor' in v.get('name','') or 'CDN' in v.get('name',''):
+            for p in v.get('properties',{}).get('addressPrefixes',[]):
+                print(p)
+except: pass
+" >> "$ranges_file" || true
+
+    # ── Filter to valid CIDRs only ────────────────────────────────
+    grep -E '/[0-9]+$' "$ranges_file" 2>/dev/null | sort -u > "${ranges_file}.tmp"
+    mv "${ranges_file}.tmp" "$ranges_file" 2>/dev/null || true
+
+    log_ok "Loaded $(safe_count "$ranges_file") CDN CIDR ranges (CF/Fastly/CloudFront/Akamai/Sucuri/Imperva/Bunny/Azure)"
+    echo "$ranges_file"
+}
+
+detect_cdn() {
+    local domain="$1"
+    local headers
+
+    headers=$(curl -sI --max-time 10 "https://${domain}" 2>/dev/null | \
+        grep -iE "cf-ray|cloudflare|x-served-by|x-cache|via|x-amz-cf|x-cdn|akamai|fastly" || true)
+
+    if [[ -n "$headers" ]]; then
+        log_warn "CDN/Proxy detected:"
+        echo "$headers" | while read -r line; do
+            echo -e "    ${YELLOW}▶ $line${NC}"
+        done
+        return 0
+    fi
+    return 1
+}
+
+discover_origins() {
+    local domain="$1"
+    local output_dir="$2"
+    local all_ips_file="$output_dir/.all_discovered_ips.tmp"
+    local confirmed_file="$output_dir/confirmed_origins.txt"
+    local candidate_file="$output_dir/candidate_origins.txt"
+    local cdn_ranges
+
+    : > "$all_ips_file"
+    : > "$confirmed_file"
+    : > "$candidate_file"
+
+    cdn_ranges=$(fetch_cdn_ranges || true)
+
+    # ── Helper: add IP with metadata ─────────────────────────────
+    add_ip() {
+        local ip="$1" source="$2" detail="$3"
+        is_valid_ipv4 "$ip" || return
+
+        # Skip private/bogon IPs
+        case "$ip" in
+            10.*|127.*|0.*|169.254.*|192.168.*|255.*) return ;;
+            172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return ;;
+        esac
+
+        local class="candidate"
+        if is_cdn_ip "$ip" "$cdn_ranges"; then
+            class="cdn"
+        elif [[ "$source" == *MX* || "$source" == *SPF* ]]; then
+            class="mail"
+        fi
+
+        if grep -q "^${ip}|" "$all_ips_file" 2>/dev/null; then
+            log_info "[DUP] $ip  ← $source"
+            return
+        fi
+
+        echo "${ip}|${source}|${detail}|${class}" >> "$all_ips_file"
+
+        case "$class" in
+            cdn)  log_info "[CDN]  $ip  ← $source: $detail" ;;
+            mail) log_info "[MAIL] $ip  ← $source: $detail (mail infra, not web origin)" ;;
+            *)    log_ok "[CANDIDATE] $ip  ← $source: $detail" ;;
+        esac
+    }
+
+    # ── T1: Direct DNS A record ───────────────────────────────────
+    log_info "[T1] Direct DNS A record..."
+    for ip in $(dig +short A "$domain" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true); do
+        add_ip "$ip" "T1-DNS" "A record"
+    done
+
+    # ── T2: Historical DNS via HackerTarget ──────────────────────
+    log_info "[T2] Historical DNS via HackerTarget..."
+    for ip in $(curl -s --max-time 10 "https://api.hackertarget.com/hostsearch/?q=${domain}" 2>/dev/null | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true); do
+        add_ip "$ip" "T2-HackerTarget" "Historical DNS"
+    done
+
+    # ── T3: SSL cert SANs via crt.sh → resolve all IPs ───────────
+    log_info "[T3] SSL cert SANs via crt.sh..."
+    local crt_domains
+    crt_domains=$(curl -s --max-time 15 "https://crt.sh/?q=%25.${domain}&output=json" 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except: sys.exit(0)
+seen = set()
+for d in data:
+    for n in d.get('name_value', '').split('\n'):
+        n = n.strip().lstrip('*.')
+        if n and n not in seen:
+            seen.add(n)
+            print(n)
+" 2>/dev/null || true)
+
+    for san in $crt_domains; do
+        [[ -z "$san" ]] && continue
+        # Resolve ALL IPs for this SAN, not just the first
+        for san_ip in $(dig +short A "$san" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true); do
+            add_ip "$san_ip" "T3-crtsh" "SAN: $san"
+        done
+    done
+
+    # ── T4: MX record IPs ────────────────────────────────────────
+    log_info "[T4] MX record IPs..."
+    for mx in $(dig +short MX "$domain" 2>/dev/null | awk '{print $2}' | sed 's/\.$//' || true); do
+        local mx_ip
+        mx_ip=$(dig +short A "$mx" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+        [[ -n "$mx_ip" ]] && add_ip "$mx_ip" "T4-MX" "Mail server: $mx"
+    done
+
+    # ── T5: SPF IPs ──────────────────────────────────────────────
+    log_info "[T5] SPF record IP extraction..."
+    local spf_data spf_ips
+    spf_data=$(dig +short TXT "$domain" 2>/dev/null | grep "v=spf1" || true)
+    if [[ -n "$spf_data" ]]; then
+        spf_ips=$(echo "$spf_data" | grep -oE 'ip[46]:[0-9a-fA-F:.]+/[0-9]+|ip[46]:[0-9a-fA-F:.]+' | \
+            sed 's/ip[46]://' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+        for ip in $spf_ips; do
+            add_ip "$ip" "T5-SPF" "SPF ip entry"
+        done
+        for inc in $(echo "$spf_data" | grep -oE 'include:[^ ]+' || true); do
+            inc="${inc#include:}"
+            local inc_ip
+            inc_ip=$(dig +short A "$inc" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+            [[ -n "$inc_ip" ]] && add_ip "$inc_ip" "T5-SPF-include" "SPF include: $inc"
+        done
+    fi
+
+    # ── T6: Alternative DNS resolvers ────────────────────────────
+    # CDN split-horizon or geo-routing may return different IPs on different resolvers
+    log_info "[T6] Alternative DNS resolvers (split-horizon bypass)..."
+    for resolver in 8.8.8.8 1.1.1.1 208.67.222.222 9.9.9.9 64.6.64.6 198.41.0.4; do
+        for ip in $(dig +short A "$domain" "@${resolver}" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true); do
+            add_ip "$ip" "T6-AltResolver" "DNS via $resolver"
+        done
+    done
+
+    # ── T7: CIRCL Passive DNS (free, no key) ─────────────────────
+    log_info "[T7] CIRCL Passive DNS..."
+    curl -s --max-time 12 "https://www.circl.lu/pdns/query/${domain}" 2>/dev/null | \
+        grep -i '"rrtype":"A"' | grep -oE '"rdata":"[0-9.]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        while read -r ip; do
+            add_ip "$ip" "T7-CIRCL-pDNS" "CIRCL passive DNS"
+        done || true
+
+    # ── T8: Origin subdomain pattern probing ─────────────────────
+    # Many operators forget to put origin/direct/www2/staging behind the CDN
+    log_info "[T8] Origin subdomain pattern probing..."
+    local root_domain
+    root_domain=$(echo "$domain" | awk -F. '{if(NF>2){print $(NF-1)"."$NF}else{print $0}}')
+    local origin_prefixes=(
+        "origin" "direct" "real" "unproxied" "www2" "server"
+        "backend" "api" "app" "host" "static" "assets"
+        "cpanel" "whm" "webmail" "admin" "staging" "dev"
+        "origin.${root_domain}" "direct.${root_domain}"
+        "mail" "smtp" "ftp" "ssh" "vpn"
+        "origin-www" "www-origin" "real-${root_domain}"
+    )
+    for prefix in "${origin_prefixes[@]}"; do
+        local probe_host
+        # If prefix already contains a dot treat as FQDN, else prepend to domain
+        if echo "$prefix" | grep -q '\.'; then
+            probe_host="$prefix"
+        else
+            probe_host="${prefix}.${domain}"
+        fi
+        for ip in $(dig +short A "$probe_host" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true); do
+            add_ip "$ip" "T8-OriginSubdomain" "Subdomain: $probe_host"
+        done
+    done
+
+    # ── T9: SOA record MNAME (primary nameserver IP) ─────────────
+    log_info "[T9] SOA record MNAME lookup..."
+    local soa_mname
+    soa_mname=$(dig +short SOA "$domain" 2>/dev/null | awk '{print $1}' | sed 's/\.$//')
+    if [[ -n "$soa_mname" ]]; then
+        local soa_ip
+        soa_ip=$(dig +short A "$soa_mname" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+        [[ -n "$soa_ip" ]] && add_ip "$soa_ip" "T9-SOA" "SOA MNAME: $soa_mname"
+    fi
+
+    # ── T10: NS record IP resolution ─────────────────────────────
+    # Self-hosted authoritative nameservers often run on the origin server
+    log_info "[T10] Authoritative NS record IPs..."
+    for ns in $(dig +short NS "$domain" 2>/dev/null | sed 's/\.$//' || true); do
+        local ns_ip
+        ns_ip=$(dig +short A "$ns" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+        [[ -n "$ns_ip" ]] && add_ip "$ns_ip" "T10-NS" "Nameserver: $ns"
+    done
+
+    # ── T11: AAAA record → IPv4 mapping ──────────────────────────
+    # IPv6 addresses sometimes bypass CDN geo-routing and map to origin
+    log_info "[T11] AAAA IPv6 record (mapped to IPv4 where possible)..."
+    for aaaa in $(dig +short AAAA "$domain" 2>/dev/null | grep -vE '^(2606:|2400:|2a06:|2803:|2c0f:|26[0-9][0-9]:)' || true); do
+        # Convert IPv4-mapped IPv6 (::ffff:x.x.x.x) to plain IPv4
+        local v4
+        v4=$(echo "$aaaa" | grep -oE '::ffff:[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+        [[ -n "$v4" ]] && add_ip "$v4" "T11-AAAA" "IPv4-mapped AAAA: $aaaa"
+    done
+
+    # ── T12: Wayback Machine — extract direct-IP accesses ────────
+    log_info "[T12] Wayback Machine CDX for direct IP URLs..."
+    curl -s --max-time 15 \
+        "https://web.archive.org/cdx/search/cdx?url=${domain}/*&output=text&fl=original&collapse=original&limit=2000" \
+        2>/dev/null | grep -oE 'https?://[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | \
+        while read -r ip; do
+            add_ip "$ip" "T12-Wayback" "Direct IP in Wayback archive"
+        done || true
+
+    # ── T13: Shodan (optional — set SHODAN_KEY env var) ──────────
+    if [[ -n "${SHODAN_KEY:-}" ]]; then
+        log_info "[T13] Shodan domain/SSL/favicon search..."
+
+        # Domain DNS search via Shodan
+        curl -s --max-time 15 \
+            "https://api.shodan.io/dns/domain/${domain}?key=${SHODAN_KEY}" 2>/dev/null | \
+            python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data.get('data', []):
+        if r.get('type') == 'A':
+            print(r.get('value', ''))
+    # subdomains with direct IPs
+    for s in data.get('subdomains', []):
+        ip = data.get(s, {}).get('ip', '')
+        if ip: print(ip)
+except: pass
+" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | while read -r ip; do
+            add_ip "$ip" "T13-Shodan-DNS" "Shodan DNS record"
+        done || true
+
+        # SSL cert CN/SAN search on Shodan
+        curl -s --max-time 15 \
+            "https://api.shodan.io/shodan/host/search?key=${SHODAN_KEY}&query=ssl.cert.subject.cn:${domain}&facets=ip_str" \
+            2>/dev/null | python3 -c "
+import json, sys
+try:
+    for m in json.load(sys.stdin).get('matches', []):
+        print(m.get('ip_str', ''))
+except: pass
+" 2>/dev/null | while read -r ip; do
+            add_ip "$ip" "T13-Shodan-SSL" "Shodan SSL cert match"
+        done || true
+
+        # Favicon hash lookup on Shodan
+        local fav_data fav_hash
+        fav_data=$(curl -sk --max-time 10 "https://${domain}/favicon.ico" 2>/dev/null | base64 -w0 2>/dev/null || true)
+        if [[ -n "$fav_data" ]]; then
+            fav_hash=$(echo "$fav_data" | python3 -c "
+import sys, hashlib, base64
+raw = base64.b64decode(sys.stdin.read().strip())
+b64 = base64.encodebytes(raw).decode()
+print(hashlib.md5(b64.encode()).hexdigest())
+" 2>/dev/null || true)
+            if [[ -n "$fav_hash" ]]; then
+                log_info "[T13] Favicon hash: $fav_hash — querying Shodan..."
+                curl -s --max-time 15 \
+                    "https://api.shodan.io/shodan/host/search?key=${SHODAN_KEY}&query=http.favicon.hash:${fav_hash}" \
+                    2>/dev/null | python3 -c "
+import json, sys
+try:
+    for m in json.load(sys.stdin).get('matches', []):
+        print(m.get('ip_str', ''))
+except: pass
+" 2>/dev/null | while read -r ip; do
+                    add_ip "$ip" "T13-Shodan-Favicon" "Shodan favicon hash match"
+                done || true
+            fi
+        fi
+    else
+        log_info "[T13] Shodan skipped (set SHODAN_KEY env var to enable)"
+    fi
+
+    # ── T14: SecurityTrails (optional — set SECURITYTRAILS_KEY) ──
+    if [[ -n "${SECURITYTRAILS_KEY:-}" ]]; then
+        log_info "[T14] SecurityTrails historical DNS..."
+        curl -s --max-time 15 \
+            -H "apikey: ${SECURITYTRAILS_KEY}" \
+            "https://api.securitytrails.com/v1/history/${domain}/dns/a" 2>/dev/null | \
+            python3 -c "
+import json, sys
+try:
+    for rec in json.load(sys.stdin).get('records', []):
+        for v in rec.get('values', []):
+            print(v.get('ip', ''))
+except: pass
+" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | while read -r ip; do
+            add_ip "$ip" "T14-SecurityTrails" "Historical A record"
+        done || true
+    else
+        log_info "[T14] SecurityTrails skipped (set SECURITYTRAILS_KEY env var to enable)"
+    fi
+
+    # ── T15: VirusTotal passive DNS (optional — set VT_KEY) ──────
+    if [[ -n "${VT_KEY:-}" ]]; then
+        log_info "[T15] VirusTotal passive DNS..."
+        curl -s --max-time 15 \
+            -H "x-apikey: ${VT_KEY}" \
+            "https://www.virustotal.com/api/v3/domains/${domain}/resolutions?limit=40" 2>/dev/null | \
+            python3 -c "
+import json, sys
+try:
+    for r in json.load(sys.stdin).get('data', []):
+        ip = r.get('attributes', {}).get('ip_address', '')
+        if ip: print(ip)
+except: pass
+" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | while read -r ip; do
+            add_ip "$ip" "T15-VirusTotal" "VirusTotal passive DNS"
+        done || true
+    else
+        log_info "[T15] VirusTotal skipped (set VT_KEY env var to enable)"
+    fi
+
+    # ── T16: Crimeflare public database (no API key needed) ──────
+    # Crowd-sourced DB of real IPs behind Cloudflare — built from
+    # historical CF-Connecting-IP leaks and email header analysis.
+    log_info "[T16] Crimeflare public database lookup..."
+    local crimeflare_ip
+    crimeflare_ip=$(curl -s --max-time 12 \
+        "http://crimeflare.org:82/cgi-bin/cfsearch.cgi" \
+        --data "cfS=${domain}" 2>/dev/null | \
+        grep -oE 'IP:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -5 || true)
+    for ip in $crimeflare_ip; do
+        add_ip "$ip" "T16-Crimeflare" "Crimeflare historical CF leak"
+    done
+
+    # ── T17: Censys SSL cert / host search ───────────────────────
+    # Censys indexes internet-wide scans. Searching the domain cert CN/SAN
+    # finds servers that exposed the cert directly without CDN fronting.
+    log_info "[T17] Censys SSL cert search..."
+    if [[ -n "${CENSYS_ID:-}" && -n "${CENSYS_SECRET:-}" ]]; then
+        curl -s --max-time 15 \
+            -u "${CENSYS_ID}:${CENSYS_SECRET}" \
+            "https://search.censys.io/api/v2/hosts/search?q=parsed.names%3A${domain}&per_page=25" \
+            2>/dev/null | python3 -c "
+import json, sys
+try:
+    for h in json.load(sys.stdin).get('result', {}).get('hits', []):
+        ip = h.get('ip', '')
+        if ip: print(ip)
+except: pass
+" 2>/dev/null | while read -r ip; do
+            add_ip "$ip" "T17-Censys" "Censys SSL cert match: $domain"
+        done || true
+    else
+        log_info "[T17] Censys skipped — set CENSYS_ID and CENSYS_SECRET env vars"
+        log_info "[T17] Free signup: https://accounts.censys.io/register"
+    fi
+
+    # ── T18: Non-CDN subdomain IP sweep ──────────────────────────
+    # Resolves all discovered subdomains and flags any whose IPs fall
+    # outside CDN ranges — these are direct origin server candidates.
+    log_info "[T18] Non-CDN subdomain IP sweep..."
+    local live_file="${OUTPUT_DIR:-/tmp}/live_hosts.txt"
+    local subs_file="${OUTPUT_DIR:-/tmp}/dns_bruteforce/all_subdomains.txt"
+    local sweep_src=""
+    [[ -s "$live_file" ]] && sweep_src="$live_file"
+    [[ -z "$sweep_src" && -s "$subs_file" ]] && sweep_src="$subs_file"
+
+    if [[ -n "$sweep_src" ]]; then
+        sed 's~https\?://~~;s~/.*~~' "$sweep_src" 2>/dev/null | \
+            grep -E "\.${domain//./\\.}$" | sort -u | head -150 | \
+            while read -r sub; do
+                [[ -z "$sub" ]] && continue
+                local sub_ip
+                sub_ip=$(dig +short A "$sub" 2>/dev/null | \
+                    grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+                [[ -z "$sub_ip" ]] && continue
+                if ! is_cdn_ip "$sub_ip" "$cdn_ranges"; then
+                    add_ip "$sub_ip" "T18-SubSweep" "Non-CDN subdomain: $sub"
+                fi
+            done || true
+    else
+        log_info "[T18] Subdomain sweep skipped — run step 3 before step 0 for best results"
+    fi
+
+
+    # ── Summary ──────────────────────────────────────────────────
+    local total_candidates cdn_ips
+    total_candidates=$(grep -c '|candidate' "$all_ips_file" 2>/dev/null || echo 0)
+    cdn_ips=$(grep -c '|cdn' "$all_ips_file" 2>/dev/null || echo 0)
+    log_info "Discovery complete — candidates: $total_candidates  CDN: $cdn_ips"
+
+    # Write non-CDN candidates to candidate_origins.txt
+    grep '|candidate' "$all_ips_file" 2>/dev/null | cut -d'|' -f1 | sort -u > "$candidate_file" || true
+
+    echo "$all_ips_file"
+}
+
+confirm_origins() {
+    local domain="$1"
+    local all_ips_file="$2"
+    local confirmed_file="$3"
+
+    # Try HTTPS first, fall back to HTTP
+    local base_proto="https"
+    curl -sI --max-time 10 "https://${domain}" > /dev/null 2>&1 || base_proto="http"
+
+    local base_status base_len base_title
+    base_status=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "${base_proto}://${domain}" 2>/dev/null || echo "000")
+    base_len=$(curl -sk --max-time 15 "${base_proto}://${domain}" 2>/dev/null | wc -c || echo "0")
+    base_title=$(curl -sk --max-time 15 "${base_proto}://${domain}" 2>/dev/null | \
+        grep -oiE '<title>[^<]*</title>' | head -1 | sed 's/<[^>]*>//g' | tr -d '\r\n' || echo "")
+
+    log_info "baseline: status=$base_status len=$base_len title='$base_title'"
+
+    local confirmed_count=0
+    while IFS='|' read -r ip source detail class; do
+        [[ "$class" == "cdn" || "$class" == "mail" ]] && continue
+        [[ -z "$ip" ]] && continue
+
+        local c_status c_len c_title
+
+        # Method 1: HTTP title match via --resolve
+        local c_resp
+        c_resp=$(curl -sk -L --max-time 12 \
+            --resolve "${domain}:443:${ip}" --resolve "${domain}:80:${ip}" \
+            "${base_proto}://${domain}" 2>/dev/null || true)
+
+        c_status=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 12 \
+            --resolve "${domain}:443:${ip}" --resolve "${domain}:80:${ip}" \
+            "${base_proto}://${domain}" 2>/dev/null || echo "000")
+
+        c_len=$(echo "$c_resp" | wc -c || echo "0")
+        c_title=$(echo "$c_resp" | grep -oiE '<title>[^<]*</title>' | head -1 | sed 's/<[^>]*>//g' | tr -d '\r\n' || echo "")
+
+        if [[ "$c_status" != "000" && -n "$base_title" && -n "$c_title" && "$c_title" == "$base_title" ]]; then
+            log_ok "[CONFIRMED ORIGIN] $ip (title match | status=$c_status)"
+            echo "$ip  [CONFIRMED title match | via $source — $detail | status=$c_status len=$c_len]" >> "$confirmed_file"
+            ((confirmed_count++))
+            continue
+        fi
+
+        # Method 2: Baseline failed (CDN blocking curl) — try TCP + direct Host-header request
+        if [[ "$base_status" == "000" || -z "$base_title" ]]; then
+            local tcp_open=0
+            timeout 5 bash -c "echo >/dev/tcp/${ip}/443" 2>/dev/null && tcp_open=1 || true
+            [[ "$tcp_open" -eq 0 ]] && timeout 5 bash -c "echo >/dev/tcp/${ip}/80" 2>/dev/null && tcp_open=1 || true
+
+            if [[ "$tcp_open" -eq 1 ]]; then
+                local direct_resp direct_title
+                direct_resp=$(curl -sk -L --max-time 12 \
+                    -H "Host: ${domain}" \
+                    "${base_proto}://${ip}" 2>/dev/null || true)
+                direct_title=$(echo "$direct_resp" | grep -oiE '<title>[^<]*</title>' | head -1 | sed 's/<[^>]*>//g' | tr -d '\r\n' || echo "")
+
+                if [[ -n "$direct_title" ]]; then
+                    log_ok "[CONFIRMED ORIGIN] $ip (TCP open + serves domain | title='$direct_title')"
+                    echo "$ip  [CONFIRMED tcp+host | via $source — $detail | title=$direct_title]" >> "$confirmed_file"
+                    ((confirmed_count++))
+                    continue
+                elif [[ "$c_status" != "000" ]]; then
+                    log_ok "[CONFIRMED ORIGIN] $ip (TCP open + HTTP $c_status)"
+                    echo "$ip  [CONFIRMED tcp+http | via $source — $detail | status=$c_status]" >> "$confirmed_file"
+                    ((confirmed_count++))
+                    continue
+                fi
+            fi
+        fi
+
+        log_info "[unconfirmed] $ip (status=$c_status title='${c_title:-none}')"
+    done < "$all_ips_file"
+
+    echo "$confirmed_count"
+}

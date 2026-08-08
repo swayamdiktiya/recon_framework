@@ -1,0 +1,341 @@
+# ============================================================
+# Recon Framework - JavaScript Analysis Module
+# ============================================================
+
+js_library_detection() {
+    local output_dir="$1"
+    local js_dir="$output_dir/js_analysis"
+
+    mkdir -p "$js_dir"
+
+    [[ -f "$output_dir/endpoints/all_endpoints.txt" ]] || { log_warn "No endpoints for JS analysis"; return; }
+
+    grep -iE '\.js(\?|$|&)' "$output_dir/endpoints/all_endpoints.txt" | head -200 > "$js_dir/js_files.txt"
+
+    local js_total
+    js_total=$(safe_count "$js_dir/js_files.txt")
+    log_info "Analyzing $js_total JavaScript files..."
+
+    : > "$js_dir/outdated_js.txt"
+
+    while read -r jsurl; do
+        [[ -z "$jsurl" ]] && continue
+        local body
+        body=$(curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$jsurl" 2>/dev/null | head -c 50000)
+        [[ -z "$body" ]] && continue
+
+        # jQuery
+        local jq_ver
+        jq_ver=$(echo "$body" | grep -oiE 'jQuery( JavaScript Library)? v([0-9]+\.[0-9]+(\.[0-9]+)?)' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        [[ -z "$jq_ver" ]] && jq_ver=$(echo "$body" | grep -oiP '"version":"[0-9]+\.[0-9]+(\.[0-9]+)?"' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+
+        if [[ -n "$jq_ver" ]]; then
+            # Check if version < 3.5.0 (known CVE)
+            local jq_major jq_minor
+            jq_major=$(echo "$jq_ver" | cut -d'.' -f1)
+            jq_minor=$(echo "$jq_ver" | cut -d'.' -f2)
+            [[ "$jq_major" -lt 3 ]] || { [[ "$jq_major" -eq 3 && "$jq_minor" -lt 5 ]]; } && \
+                echo "[OUTDATED] jQuery v$jq_ver (CVE-2020-11022/11023) - $jsurl" >> "$js_dir/outdated_js.txt"
+        fi
+
+        # AngularJS
+        local ag_ver
+        ag_ver=$(echo "$body" | grep -oiP '(AngularJS v|@angular/core@)([0-9]+\.[0-9]+(\.[0-9]+)?)' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        if [[ -n "$ag_ver" ]]; then
+            local ag_cmp
+            ag_cmp=$(echo -e "1.8.2\n$ag_ver" | sort -t'.' -k1,1n -k2,2n | tail -1)
+            [[ "$ag_cmp" != "$ag_ver" ]] && echo "[OUTDATED] AngularJS v$ag_ver (<1.8.2 - XSS) - $jsurl" >> "$js_dir/outdated_js.txt"
+        fi
+
+        # Bootstrap
+        local bs_ver
+        bs_ver=$(echo "$body" | grep -oiP '(Bootstrap v|bootstrap@)([0-9]+\.[0-9]+(\.[0-9]+)?)' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        if [[ -n "$bs_ver" ]]; then
+            local bs_major bs_minor
+            bs_major=$(echo "$bs_ver" | cut -d'.' -f1)
+            bs_minor=$(echo "$bs_ver" | cut -d'.' -f2)
+            [[ "$bs_major" == "3" || "$bs_major" == "4" && "$bs_minor" -lt 5 ]] && \
+                echo "[OUTDATED] Bootstrap v$bs_ver (<4.5.0 - XSS) - $jsurl" >> "$js_dir/outdated_js.txt"
+        fi
+
+        # Lodash
+        local lo_ver
+        lo_ver=$(echo "$body" | grep -oiP 'lodash[.@]v?([0-9]+\.[0-9]+(\.[0-9]+)?)' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        if [[ -n "$lo_ver" ]]; then
+            local lo_cmp
+            lo_cmp=$(echo -e "4.17.21\n$lo_ver" | sort -t'.' -k1,1n -k2,2n -k3,3n | tail -1)
+            [[ "$lo_cmp" != "$lo_ver" ]] && echo "[OUTDATED] Lodash v$lo_ver (<4.17.21 - CVE-2021-23337) - $jsurl" >> "$js_dir/outdated_js.txt"
+        fi
+
+        # Moment.js
+        local mo_ver
+        mo_ver=$(echo "$body" | grep -oiP 'moment\.js v([0-9]+\.[0-9]+(\.[0-9]+)?)' | head -1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)
+        if [[ -n "$mo_ver" ]]; then
+            local mo_cmp
+            mo_cmp=$(echo -e "2.29.4\n$mo_ver" | sort -t'.' -k1,1n -k2,2n -k3,3n | tail -1)
+            [[ "$mo_cmp" != "$mo_ver" ]] && echo "[OUTDATED] Moment.js v$mo_ver (<2.29.4 - ReDoS) - $jsurl" >> "$js_dir/outdated_js.txt"
+        fi
+    done < "$js_dir/js_files.txt"
+
+    local old_hits
+    old_hits=$(safe_count "$js_dir/outdated_js.txt")
+    [[ "$old_hits" -gt 0 ]] && log_info "Outdated JS library references (verify versions): $old_hits" || log_ok "No obviously outdated JS detected"
+}
+
+# Secrets in JavaScript files
+js_secrets() {
+    local output_dir="$1"
+    local js_dir="$output_dir/js_analysis"
+    local secrets_file="$js_dir/secrets_in_js.txt"
+
+    mkdir -p "$js_dir"
+    : > "$secrets_file"
+
+    [[ -f "$js_dir/js_files.txt" ]] || return
+
+    while read -r jsurl; do
+        [[ -z "$jsurl" ]] && continue
+        local body
+        body=$(curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$jsurl" 2>/dev/null | head -c 100000)
+        [[ -z "$body" ]] && continue
+
+        # HIGH-CONFIDENCE provider secret formats only. The old generic patterns
+        # (secret|password|token : anyword) matched minified variable names, "null",
+        # "true", version strings, etc. — overwhelming false positives.
+        echo "$body" | grep -aoE '(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16})' >> "$secrets_file" 2>/dev/null || true      # AWS access key
+        echo "$body" | grep -aoE 'AIza[0-9A-Za-z_-]{35}' >> "$secrets_file" 2>/dev/null || true                     # Google API key
+        echo "$body" | grep -aoE 'ya29\.[0-9A-Za-z_-]{20,}' >> "$secrets_file" 2>/dev/null || true                  # Google OAuth token
+        echo "$body" | grep -aoE 'xox[baprs]-[0-9A-Za-z-]{10,48}' >> "$secrets_file" 2>/dev/null || true            # Slack token
+        echo "$body" | grep -aoE '(sk|pk|rk)_(live|test)_[0-9A-Za-z]{16,}' >> "$secrets_file" 2>/dev/null || true    # Stripe key
+        echo "$body" | grep -aoE 'gh[pousr]_[0-9A-Za-z]{36,}' >> "$secrets_file" 2>/dev/null || true                # GitHub token
+        echo "$body" | grep -aoE 'SG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43}' >> "$secrets_file" 2>/dev/null || true  # SendGrid
+        echo "$body" | grep -aoE 'AC[0-9a-f]{32}' >> "$secrets_file" 2>/dev/null || true                            # Twilio SID
+        echo "$body" | grep -aoE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' >> "$secrets_file" 2>/dev/null || true  # JWT
+        echo "$body" | grep -aoE -- '-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----' >> "$secrets_file" 2>/dev/null || true       # private key
+        # Generic key=value only when the VALUE is long and high-entropy-looking, and
+        # not an obvious non-secret. Written to a SEPARATE low-confidence file.
+        echo "$body" | grep -aoiE '(api[_-]?key|secret|access[_-]?token|client[_-]?secret)"?['"'"']?[[:space:]]*[:=][[:space:]]*"?['"'"']?[A-Za-z0-9_\-]{24,}' \
+            2>/dev/null | grep -aviE '(=|:)[[:space:]]*"?(null|true|false|undefined|function|process\.env|your[_-]?|xxx|example|changeme|placeholder)' \
+            >> "$js_dir/secrets_lowconfidence.txt" 2>/dev/null || true
+    done < "$js_dir/js_files.txt"
+
+    sort -u "$secrets_file" -o "$secrets_file"
+
+    # High-signal secret scanners (verified detectors, low FP) if installed.
+    if check_tool trufflehog && [[ -d "$js_dir" ]]; then
+        log_info "Running trufflehog (verified secrets) on collected JS..."
+        trufflehog filesystem "$js_dir" --only-verified --no-update 2>/dev/null \
+            | grep -aiE 'Detector Type|Verified|Raw result' >> "$js_dir/trufflehog_verified.txt" 2>/dev/null || true
+        [[ -s "$js_dir/trufflehog_verified.txt" ]] && log_vuln "trufflehog verified secrets — see $js_dir/trufflehog_verified.txt"
+    elif check_tool gitleaks && [[ -d "$js_dir" ]]; then
+        log_info "Running gitleaks (no-git) on collected JS..."
+        gitleaks detect --no-git --source "$js_dir" --report-path "$js_dir/gitleaks.json" 2>/dev/null || true
+        [[ -s "$js_dir/gitleaks.json" ]] && log_info "gitleaks results — review $js_dir/gitleaks.json"
+    fi
+
+    local secret_hits lowconf_hits
+    secret_hits=$(safe_count "$secrets_file")
+    lowconf_hits=$(safe_count "$js_dir/secrets_lowconfidence.txt")
+    [[ "$secret_hits" -gt 0 ]] && log_vuln "High-confidence secrets in JS: $secret_hits (see $secrets_file)"
+    [[ "$lowconf_hits" -gt 0 ]] && log_info "Low-confidence key-like strings in JS: $lowconf_hits (manual review: $js_dir/secrets_lowconfidence.txt)"
+    [[ "$secret_hits" -eq 0 && "$lowconf_hits" -eq 0 ]] && log_ok "No exposed secrets detected in JS"
+}
+
+# Extract interesting comments and hidden routes
+js_comments_and_routes() {
+    local output_dir="$1"
+    local js_dir="$output_dir/js_analysis"
+    local comments_file="$js_dir/comments_routes.txt"
+
+    [[ -f "$js_dir/js_files.txt" ]] || return
+
+    : > "$comments_file"
+
+    while read -r jsurl; do
+        [[ -z "$jsurl" ]] && continue
+        local body
+        body=$(curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$jsurl" 2>/dev/null | head -c 100000)
+
+        # Extract TODO/FIXME comments
+        echo "$body" | grep -oiE '(TODO|FIXME|XXX|HACK|BUG):?[[:space:]]+.+' >> "$comments_file" 2>/dev/null || true
+
+        # Look for hidden API routes
+        echo "$body" | grep -oiE '/api/[a-z0-9/_-]+' >> "$comments_file" 2>/dev/null || true
+        echo "$body" | grep -oiE '["\x27]/v[0-9]+/[a-z0-9/_-]+["\x27\"]' >> "$comments_file" 2>/dev/null || true
+    done < "$js_dir/js_files.txt"
+
+    sort -u "$comments_file" -o "$comments_file"
+}
+
+# ─── Semgrep/CodeQL Static Analysis on JS (Priority 8) ────────
+semgrep_js_scan() {
+    local output_dir="$1"
+    local semgrep_dir="$output_dir/semgrep_js"
+    mkdir -p "$semgrep_dir"
+
+    local js_dir="$output_dir/js_analysis"
+    [[ -f "$js_dir/js_files.txt" ]] || { log_info "No JS files to scan"; return; }
+
+    local semgrep_rules_dir="$semgrep_dir/rules"
+    local semgrep_results="$semgrep_dir/semgrep_results.txt"
+    : > "$semgrep_results"
+
+    # ─── Semgrep scan ─────────────────────────────────────────────
+    if check_tool semgrep; then
+        log_info "Running Semgrep static analysis on JS files..."
+
+        mkdir -p "$semgrep_rules_dir"
+
+        # Write custom JS security rules inline
+        cat > "$semgrep_rules_dir/js-security.yaml" << 'RULES'
+rules:
+  - id: js-hardcoded-credentials
+    pattern-either:
+      - pattern: 'const $KEY = "$PASSWORD";'
+      - pattern: 'const $KEY = "$SECRET";'
+      - pattern: 'let $KEY = "$SECRET";'
+      - pattern: 'let $KEY = "$PASSWORD";'
+    message: "Hardcoded credential in JavaScript"
+    severity: ERROR
+    languages: [javascript, typescript]
+
+  - id: js-innerhtml-xss
+    pattern-either:
+      - pattern: 'document.write($X)'
+      - pattern: 'document.writeln($X)'
+      - pattern: 'element.innerHTML = $X'
+      - pattern: 'element.outerHTML = $X'
+      - pattern: '$X.innerHTML = $Y'
+      - pattern: '$X.insertAdjacentHTML($Y, $Z)'
+    message: "DOM XSS via innerHTML/document.write"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-eval-danger
+    pattern-either:
+      - pattern: 'eval($X)'
+      - pattern: 'setTimeout($X, $Y)'
+      - pattern: 'setInterval($X, $Y)'
+      - pattern: 'new Function($X)'
+    message: "Dynamic code execution via eval/setTimeout/setInterval/Function"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-open-redirect
+    pattern-either:
+      - pattern: 'window.location = $X'
+      - pattern: 'window.location.href = $X'
+      - pattern: 'window.location.replace($X)'
+      - pattern: 'location.href = $X'
+    message: "Open redirect via window.location"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-localstorage-jwt
+    pattern-either:
+      - pattern: 'localStorage.getItem("$TOKEN")'
+      - pattern: 'localStorage.getItem("jwt")'
+      - pattern: 'localStorage.setItem("token", $X)'
+      - pattern: 'localStorage.setItem("jwt", $X)'
+    message: "JWT/token stored in localStorage (XSS leak risk)"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-postmessage-verify
+    pattern-either:
+      - pattern: 'window.addEventListener("message", $X)'
+      - pattern: 'window.onmessage = $X'
+    message: "PostMessage listener - check origin validation"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-cors-allowall
+    pattern-either:
+      - pattern: 'Access-Control-Allow-Origin: "*"'
+      - pattern: "'Access-Control-Allow-Origin', '*'"
+      - pattern: '"Access-Control-Allow-Origin", "*"'
+    message: "CORS allows all origins (*)"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-prototype-pollution
+    pattern-either:
+      - pattern: '$.extend(true, {}, $X)'
+      - pattern: '_.merge({}, $X)'
+      - pattern: 'Object.assign({}, $X)'
+    message: "Potential prototype pollution via deep merge"
+    severity: WARNING
+    languages: [javascript, typescript]
+
+  - id: js-fetch-with-token
+    pattern-either:
+      - pattern: 'fetch($X, {headers: {"Authorization": "Bearer $Y"}})'
+      - pattern: 'axios.get($X, {headers: {"Authorization": "Bearer $Y"}})'
+      - pattern: '\$http.get($X, {headers: {"Authorization": "Bearer $Y"}})'
+    message: "Hardcoded Bearer token - check if this is a secret"
+    severity: INFO
+    languages: [javascript, typescript]
+RULES
+
+        # Download semgrep-registry rules for JS (alternative to custom)
+        # Using semgrep's built-in rules when offline is better
+
+        # Run semgrep on each JS file (limit to 20 files for speed)
+        local total_issues=0
+        local js_count=0
+        while read -r jsurl; do
+            [[ -z "$jsurl" ]] && continue
+            [[ $js_count -ge 20 ]] && break
+            js_count=$((js_count + 1))
+
+            # Download JS file to temp location
+            local js_local="$semgrep_dir/$(echo "$jsurl" | md5sum | cut -d' ' -f1).js"
+            curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$jsurl" 2>/dev/null > "$js_local" 2>/dev/null || continue
+            [[ ! -s "$js_local" ]] && { rm -f "$js_local"; continue; }
+
+            timeout 30 semgrep --config "$semgrep_rules_dir/js-security.yaml" \
+                --json "$js_local" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    results = data.get('results', [])
+    for r in results:
+        print(f'{r.get(\"check_id\",\"\")}|{r.get(\"path\",\"\")}|{r.get(\"start\",{}).get(\"line\",0)}|{r.get(\"extra\",{}).get(\"message\",\"\")}')
+except:
+    pass" >> "$semgrep_results" 2>/dev/null || true
+
+            rm -f "$js_local"
+        done < "$js_dir/js_files.txt"
+
+        total_issues=$(safe_count "$semgrep_results")
+        [[ "$total_issues" -gt 0 ]] && log_vuln "Semgrep: $total_issues security issues in JS" || log_ok "Semgrep: no issues found"
+    else
+        log_info "semgrep not installed - installing semgrep rules in report for manual review"
+        cat > "$semgrep_dir/README.txt" << 'EOF'
+Manual Semgrep Rules for JS Security Review:
+  Install: pip install semgrep
+  Run:     semgrep --config=<rules.yaml> <js_file>
+
+Custom Rules (js-security.yaml) cover:
+  - Hardcoded credentials (secrets in code)
+  - DOM XSS via innerHTML / document.write
+  - eval() / setTimeout strings / new Function
+  - Open redirect via window.location
+  - JWT in localStorage
+  - PostMessage without origin validation
+  - Prototype pollution via deep merge
+  - Hardcoded Bearer tokens
+  - CORS allow-all origins
+
+Auto-generated rule file: js_security_rules.yaml
+EOF
+
+        # Write rules file even without semgrep installed
+        cp "$semgrep_rules_dir/js-security.yaml" "$semgrep_dir/js_security_rules.yaml" 2>/dev/null || true
+        log_info "Semgrep JS rules saved to $semgrep_dir/js_security_rules.yaml - run manually: semgrep --config $semgrep_dir/js_security_rules.yaml <js_file>"
+    fi
+
+    # Cleanup
+    rm -rf "$semgrep_rules_dir" 2>/dev/null || true
+    log_ok "Static JS analysis complete - see $semgrep_dir/"
+}

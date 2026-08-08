@@ -1,0 +1,133 @@
+# ============================================================
+# Recon Framework - Subdomain Enumeration Module
+# ============================================================
+
+subdomain_enum() {
+    local domain="$1"
+    local output_dir="$2"
+
+    if is_valid_ipv4 "$domain"; then
+        log_warn "Raw IP — DNS enumeration skipped."
+        return
+    fi
+
+    local dns_brute_out="$output_dir/dns_bruteforce"
+    mkdir -p "$dns_brute_out"
+
+    # ─── Passive enumeration (parallel) ─────────────────────────
+    log_info "Running passive subdomain discovery..."
+    local pids=()
+
+    if check_tool subfinder; then
+        subfinder -d "$domain" -silent -o "$dns_brute_out/subfinder_passive.txt" 2>/dev/null &
+        pids+=($!)
+    fi
+
+    if check_tool amass; then
+        timeout 120 amass enum -passive -d "$domain" -timeout 5 \
+            -o "$dns_brute_out/amass_passive.txt" 2>/dev/null &
+        pids+=($!)
+    fi
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    local subfinder_count amass_count
+    subfinder_count=$(safe_count "$dns_brute_out/subfinder_passive.txt")
+    amass_count=$(safe_count "$dns_brute_out/amass_passive.txt")
+    [[ "$subfinder_count" -gt 0 ]] && log_ok "subfinder found $subfinder_count subdomains"
+    [[ "$amass_count" -gt 0 ]] && log_ok "amass found $amass_count subdomains"
+
+    # ─── Ensure resolver list ──────────────────────────────────
+    local resolvers="${CONFIG[CACHE_DIR]}/resolvers.txt"
+    if [[ ! -s "$resolvers" ]] || [[ -z "$(find "$resolvers" -mtime -7 2>/dev/null)" ]]; then
+        if ! curl -sL --max-time 10 "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt" -o "$resolvers" 2>/dev/null; then
+            printf '1.1.1.1\n8.8.8.8\n9.9.9.9\n8.8.4.4\n' > "$resolvers"
+        fi
+    fi
+
+    # ─── Active brute force ────────────────────────────────────
+    local dns_wl="${CONFIG[WORDLISTS_DIR]}/dns_subdomains.txt"
+    if [[ ! -s "$dns_wl" ]]; then
+        download_if_missing "${CONFIG[DNS_WORDLIST_URL]}" "$dns_wl" 30
+    fi
+
+    if [[ -s "$dns_wl" ]]; then
+        if check_tool puredns; then
+            log_info "Running puredns for accurate active brute force..."
+            puredns bruteforce "$dns_wl" "$domain" \
+                -r "$resolvers" --quiet \
+                -w "$dns_brute_out/puredns_active.txt" 2>/dev/null || true
+            log_ok "puredns found $(safe_count "$dns_brute_out/puredns_active.txt") subdomains"
+        elif check_tool dnsx; then
+            log_info "Running dnsx active brute force..."
+            dnsx -d "$domain" -w "$dns_wl" -a -resp -silent \
+                -o "$dns_brute_out/dnsx_active.txt" 2>/dev/null || true
+            log_ok "dnsx found $(safe_count "$dns_brute_out/dnsx_active.txt") subdomains"
+        fi
+    fi
+
+    # ─── TLS certificate discovery ────────────────────────────
+    if check_tool tlsx; then
+        log_info "Running tlsx for TLS cert-based subdomain discovery..."
+        tlsx -san -cn -silent -o "$dns_brute_out/tlsx_subs.txt" \
+            -host "$domain" 2>/dev/null || true
+        log_ok "tlsx found $(safe_count "$dns_brute_out/tlsx_subs.txt") subdomains"
+    fi
+
+    # ─── Combine all results ──────────────────────────────────
+    local all_subs="$dns_brute_out/all_subdomains.txt"
+    cat "$dns_brute_out"/*.txt 2>/dev/null \
+        | grep -oE "[a-zA-Z0-9._-]+\.${domain}" \
+        | sort -u > "$all_subs"
+
+    log_ok "Total unique subdomains: $(safe_count "$all_subs")"
+
+    # ─── Filter live hosts with httpx ──────────────────────────
+    local live_hosts="${output_dir}/live_hosts.txt"
+    if check_tool httpx && [[ -s "$all_subs" ]]; then
+        log_info "Probing live hosts with httpx..."
+        httpx -l "$all_subs" -silent -no-color -threads "${CONFIG[HTTPX_THREADS]}" -timeout 8 \
+            ${HDR_H[@]+"${HDR_H[@]}"} -o "$live_hosts" 2>/dev/null || true
+        log_ok "Live hosts: $(safe_count "$live_hosts")"
+    fi
+}
+
+smart_permutation() {
+    local domain="$1"
+    local output_dir="$2"
+    local dns_brute_out="$output_dir/dns_bruteforce"
+    local perm_out="$output_dir/permutations"
+
+    if is_valid_ipv4 "$domain"; then
+        return
+    fi
+
+    local subs_file="$dns_brute_out/all_subdomains.txt"
+    [[ -f "$subs_file" && -s "$subs_file" ]] || return
+
+    if ! check_tool ripgen || ! check_tool dnsx; then
+        log_warn "ripgen/dnsx not found - skipping permutation"
+        return
+    fi
+
+    mkdir -p "$perm_out"
+
+    log_info "Generating permutations with ripgen..."
+    cat "$subs_file" | ripgen -silent > "$perm_out/ripgen_wordlist.txt" 2>/dev/null || true
+    local perm_count
+    perm_count=$(safe_count "$perm_out/ripgen_wordlist.txt")
+    log_ok "ripgen generated $perm_count permutations"
+
+    log_info "Resolving permutations with dnsx..."
+    dnsx -l "$perm_out/ripgen_wordlist.txt" -a -resp -silent \
+        -o "$perm_out/resolved_perms.txt" 2>/dev/null || true
+
+    local resolved_count
+    resolved_count=$(safe_count "$perm_out/resolved_perms.txt")
+    log_ok "Found $resolved_count new live subdomains via permutation"
+
+    cat "$perm_out/resolved_perms.txt" >> "$subs_file" 2>/dev/null || true
+    sort -u "$subs_file" -o "$subs_file"
+}

