@@ -1,1 +1,37 @@
+# Recon Framework runtime output
+results/
+output/
+reports/
+logs/
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Recon artifacts
+*.log
+*.json
+*.csv
+*.txt
+*.html
+*.xml
+screenshots/
+
+# Archives
 *.zip
+*.tar
+*.tar.gz
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
