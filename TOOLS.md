@@ -4,7 +4,7 @@ This file documents the external executables and system utilities checked by the
 
 ## Count
 
-**50 tools/dependencies are currently listed in the `recon.sh` preflight array.**
+**51 tools/dependencies are currently listed in the `recon.sh` preflight array.**
 
 The count includes both dedicated security tools and general-purpose/system utilities required by some checks.
 
@@ -62,6 +62,7 @@ The count includes both dedicated security tools and general-purpose/system util
 | 48 | `dirsearch` | Web content discovery |
 | 49 | `anew` | Deduplication/append utility |
 | 50 | `waybackurls` | Wayback URL discovery |
+| 51 | `ollama` | Local AI inference engine (AI analysis) |
 
 ## Notes
 
@@ -70,6 +71,7 @@ The count includes both dedicated security tools and general-purpose/system util
 - Some tools overlap in purpose. This is intentional: the framework combines complementary passive, active, crawling, fuzzing, vulnerability-scanning, OSINT, and analysis capabilities.
 - `chromium-browser` and `chromium` are counted separately because the current preflight array checks both executable names.
 - `python3`, `curl`, `openssl`, `dig`, and `md5sum` are general utilities rather than dedicated reconnaissance products, but they are part of the current dependency inventory.
+- `ollama` is required only when AI features are enabled with the `-ai` flag.
 
 ## Source of truth
 

@@ -27,6 +27,7 @@ source "$LIB_DIR/graphql.sh.lib"
 source "$LIB_DIR/owasp_checks.sh.lib"
 source "$LIB_DIR/oob.sh.lib"
 source "$LIB_DIR/p1_checks.sh.lib"
+source "$LIB_DIR/ai.sh.lib"
 
 # ─── Parse CLI arguments ───────────────────────────────────────
 usage() {
@@ -50,6 +51,10 @@ OPTIONS:
   -j              Output final summary as JSON
   -F              FAST mode - reduces targets/payloads for faster scanning
   -S <file>       Scope file (allow/deny host regexes; "!" prefix = deny)
+  -ai             Enable AI analysis (requires Ollama running locally)
+  -ai-model <m>   AI model name (default: gemma4-e4b-SecOps)
+  -ai-url <url>   AI Ollama URL (default: http://localhost:11434)
+  -ai-q <question> Ask AI a question about scan results (post-scan)
   -h              Show this help
 EOF
     exit 0
@@ -70,6 +75,7 @@ COOKIE2=""
 AUTH_HEADER_FILE=""
 FAST_MODE=0
 SCOPE_FILE=""
+AI_Q=""
 
 declare -a AUTH_HEADERS=()
 declare -a ARJUN_HDRS=()
@@ -77,6 +83,24 @@ declare -a CURL_AUTH=()
 declare -a DALFOX_AUTH=()
 declare -a SQLMAP_AUTH=()
 declare -a HDR_H=()
+
+# Parse AI-specific arguments (long options before getopts)
+for arg in "$@"; do
+    case "$arg" in
+        -ai) AI_ENABLED=1 ;;
+    esac
+done
+# Handle -ai-model, -ai-url, -ai-q with values
+set -- "$@"  # reset positional params
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -ai-model) AI_MODEL="$2"; shift 2 ;;
+        -ai-url)   AI_URL="$2"; shift 2 ;;
+        -ai-q)     AI_Q="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
 while getopts ":yM:m:s:r:o:n:c:C:H:A:S:xfjhF" opt; do
     case $opt in
         y) AUTO_CONFIRM=1 ;;
@@ -156,7 +180,7 @@ preflight() {
                  feroxbuster wafw00f s3scanner bbot asnmap uncover jaeles theHarvester \
                  gowitness notify interactsh-client arjun x8 gf sqlmap wpscan corsy \
                  slowhttptest hydra puredns massdns dig curl openssl python3 chromium-browser chromium \
-                 sstimap subzy jwt_tool trufflehog gitleaks semgrep md5sum dirsearch anew waybackurls)
+                 sstimap subzy jwt_tool trufflehog gitleaks semgrep md5sum dirsearch anew waybackurls ollama)
 
     local have=0 miss=0
     for t in "${tools[@]}"; do
@@ -189,6 +213,14 @@ init_output() {
     # AUTHENTICATED is set properly by load_auth_headers() which runs next.
     # Initialize to 0 here; the count is recomputed after all headers are loaded.
     AUTHENTICATED=0
+
+    # Initialize AI if enabled
+    if [[ "$AI_ENABLED" -eq 1 ]]; then
+        AI_MODEL="${AI_MODEL:-${CONFIG[AI_MODEL]}}"
+        AI_URL="${AI_URL:-${CONFIG[AI_URL]}}"
+        log_info "AI model    : $AI_MODEL"
+        log_info "AI endpoint : $AI_URL"
+    fi
 
     log_info "Target      : $TARGET"
     log_info "Scan mode   : $SCAN_MODE"
@@ -230,7 +262,7 @@ log_step_progress() {
     local status="$3"
     COMPLETED_STEPS=$((COMPLETED_STEPS + 1))
     [[ "$status" == "FAIL" ]] && FAILED_STEPS=$((FAILED_STEPS + 1))
-    printf "\r${CYAN}[%d/83] Step %s: %s${NC}" "$COMPLETED_STEPS" "$step_num" "$step_name"
+    printf "\r${CYAN}[%d/85] Step %s: %s${NC}" "$COMPLETED_STEPS" "$step_num" "$step_name"
     [[ "$status" == "FAIL" ]] && printf " ${YELLOW}(FAILED)${NC}" || true
     echo ""
 }
@@ -254,6 +286,12 @@ main() {
     should_run_step 1 && ( step_1_port_scan ) || true
     should_run_step 2 && ( step_2_asn_mapping ) || true
     should_run_step 3 && ( step_3_subdomain_enum ) || true
+
+    # AI adaptive decision after initial recon
+    if [[ "$AI_ENABLED" -eq 1 ]] && should_run_step 83; then
+        ai_decide "$OUTPUT_DIR" 3
+    fi
+
     should_run_step 4 && ( step_4_permutation ) || true
     should_run_step 5 && ( step_5_endpoint_discovery ) || true
     should_run_step 6 && ( step_6_fuzz_params ) || true
@@ -341,6 +379,10 @@ main() {
     should_run_step 81 && ( step_81_saml ) || true
     should_run_step 82 && ( step_82_server_pp ) || true
     should_run_step 83 && ( step_83_blind_sqli_oob ) || true
+
+    # AI final analysis and report
+    should_run_step 84 && ( ai_analyze "$OUTPUT_DIR" ) || true
+    should_run_step 85 && ( ai_report "$OUTPUT_DIR" ) || true
 
     final_summary
 }
@@ -966,6 +1008,13 @@ for line in open(sys.argv[1]):
     except: pass
 " "$OUTPUT_DIR/findings.jsonl" 2>/dev/null | notify -silent 2>/dev/null || true
     fi
+
+    # AI natural language Q&A
+    if [[ "$AI_ENABLED" -eq 1 && -n "${AI_Q:-}" ]]; then
+        log_section "AI QUESTION"
+        ai_nlq "$OUTPUT_DIR" "$AI_Q"
+    fi
+
     log_warn "Reminder: Only test systems you are authorized to test."
 }
 

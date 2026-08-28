@@ -26,6 +26,11 @@ declare -A CONFIG=(
     [CLOUDFLARE_IPS]="https://www.cloudflare.com/ips-v4"
     [FASTLY_IPS]="https://api.fastly.com/public-ip-list"
     [AWS_RANGES]="https://ip-ranges.amazonaws.com/ip-ranges.json"
+
+    # AI configuration
+    [AI_MODEL]="gemma4-e4b-SecOps"
+    [AI_URL]="http://localhost:11434"
+    [AI_TIMEOUT]=120
 )
 
 # Security headers that should be present

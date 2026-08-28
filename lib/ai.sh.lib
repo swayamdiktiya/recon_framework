@@ -1,0 +1,477 @@
+# ============================================================
+# Recon Framework - AI Integration Library
+# Ollama-powered analysis, adaptive decisions, and reporting
+# ============================================================
+
+# AI configuration defaults
+declare -g AI_ENABLED=0
+declare -g AI_MODEL="${AI_MODEL:-gemma4-e4b-SecOps}"
+declare -g AI_URL="${AI_URL:-http://localhost:11434}"
+declare -g AI_DIR=""
+declare -g AI_TIMEOUT=120
+
+# ─── Core AI Query ───────────────────────────────────────────
+# Send a prompt to Ollama and return the response
+ai_query() {
+    local prompt="$1"
+    local system="${2:-}"
+    local timeout="${3:-$AI_TIMEOUT}"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && return 1
+
+    local payload
+    if [[ -n "$system" ]]; then
+        payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': sys.argv[1],
+    'messages': [
+        {'role': 'system', 'content': sys.argv[2]},
+        {'role': 'user', 'content': sys.argv[3]}
+    ],
+    'stream': False
+}), end='')
+" "$AI_MODEL" "$system" "$prompt" 2>/dev/null)
+    else
+        payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': sys.argv[1],
+    'messages': [
+        {'role': 'user', 'content': sys.argv[2]}
+    ],
+    'stream': False
+}), end='')
+" "$AI_MODEL" "$prompt" 2>/dev/null)
+    fi
+
+    [[ -z "$payload" ]] && { log_error "AI: Failed to build request payload"; return 1; }
+
+    local response
+    response=$(curl -s --max-time "$timeout" \
+        -X POST "${AI_URL}/api/chat" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null)
+
+    [[ -z "$response" ]] && { log_error "AI: No response from Ollama (is it running?)"; return 1; }
+
+    # Extract message content from Ollama response
+    python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    print(data.get('message', {}).get('content', ''))
+except:
+    print('')
+" <<< "$response" 2>/dev/null
+}
+
+# ─── Health check ────────────────────────────────────────────
+ai_check() {
+    [[ "$AI_ENABLED" -ne 1 ]] && return 1
+    local status
+    status=$(curl -s --max-time 5 "${AI_URL}/api/tags" 2>/dev/null | \
+        python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.stdin.read())
+    models = [m.get('name','') for m in data.get('models', [])]
+    target = sys.argv[1]
+    print('ok' if any(target in m for m in models) else 'missing')
+except:
+    print('error')
+" "$AI_MODEL" 2>/dev/null)
+
+    if [[ "$status" == "ok" ]]; then
+        log_ok "AI model '$AI_MODEL' available at $AI_URL"
+        return 0
+    elif [[ "$status" == "missing" ]]; then
+        log_warn "AI model '$AI_MODEL' not found. Pull it: ollama pull $AI_MODEL"
+        return 1
+    else
+        log_warn "AI: Ollama not reachable at $AI_URL"
+        return 1
+    fi
+}
+
+# ─── Collect scan results into a summary file ────────────────
+ai_collect_results() {
+    local output_dir="$1"
+    local collected="$output_dir/ai_analysis/.scan_summary.txt"
+    mkdir -p "$output_dir/ai_analysis"
+
+    echo "=== RECON SCAN RESULTS FOR: $TARGET ===" > "$collected"
+    echo "Scan mode: $SCAN_MODE" >> "$collected"
+    echo "Timestamp: $(date)" >> "$collected"
+    echo "" >> "$collected"
+
+    # Collect key output files
+    local -a result_files=(
+        "confirmed_origins.txt"
+        "live_hosts.txt"
+        "endpoints/all_endpoints.txt"
+        "nuclei.txt"
+        "nuclei_quick.txt"
+        "waf_detection.txt"
+        "http_headers.txt"
+        "ssl_info.txt"
+        "asn_map.txt"
+        "fuzz_results/urls_with_params.txt"
+        "dirsearch_results.txt"
+        "feroxbuster_dirs.txt"
+        "wpscan.txt"
+        "theharvester.txt"
+        "findings.jsonl"
+        "secrets_scan/secret_findings.txt"
+        "injection/gf_sqli.txt"
+        "injection/gf_xss.txt"
+        "injection/gf_ssrf.txt"
+        "injection/gf_rce.txt"
+        "idor_enhanced/idor_findings.txt"
+        "prototype_pollution/proto_pollution.txt"
+        "cloud_exposure.txt"
+    )
+
+    for f in "${result_files[@]}"; do
+        local full_path="$output_dir/$f"
+        if [[ -s "$full_path" ]]; then
+            echo "--- $f ---" >> "$collected"
+            head -100 "$full_path" >> "$collected"
+            echo "" >> "$collected"
+        fi
+    done
+
+    # Include findings summary
+    if [[ -s "$output_dir/findings.jsonl" ]]; then
+        echo "--- STRUCTURED FINDINGS SUMMARY ---" >> "$collected"
+        python3 -c "
+import json, collections
+counts = collections.Counter()
+sev = collections.Counter()
+for line in open('$output_dir/findings.jsonl'):
+    line = line.strip()
+    if not line: continue
+    try:
+        r = json.loads(line)
+        counts[r.get('confidence','INFO')] += 1
+        sev[r.get('severity','unknown')] += 1
+    except: pass
+print('By confidence:', dict(counts))
+print('By severity:', dict(sev))
+" >> "$collected" 2>/dev/null || true
+    fi
+
+    echo "$collected"
+}
+
+# ─── AI Analysis: summarize findings + recommend next steps ───
+ai_analyze() {
+    local output_dir="$1"
+    log_section "STEP 84 — AI Analysis & Next Steps"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && { log_info "AI disabled (use -ai to enable)"; return; }
+    ai_check || return 1
+
+    local summary_file
+    summary_file=$(ai_collect_results "$output_dir")
+
+    [[ ! -s "$summary_file" ]] && { log_warn "No scan results to analyze"; return; }
+
+    local scan_summary
+    scan_summary=$(cat "$summary_file")
+
+    log_info "AI analyzing $(wc -c < "$summary_file") bytes of scan data..."
+
+    local analysis
+    analysis=$(ai_query "$scan_summary" \
+"You are an expert penetration tester analyzing reconnaissance scan results.
+Analyze the scan results and provide:
+1. EXECUTIVE SUMMARY (2-3 sentences)
+2. CRITICAL FINDINGS (top 5, ranked by severity)
+3. RECOMMENDED NEXT STEPS (specific actions to take, in priority order)
+4. ATTACK SURFACE OVERVIEW (what is exposed)
+5. RISK RATING (Critical/High/Medium/Low with justification)
+
+Be specific, reference actual findings from the data. If something is missing or unclear, say so.
+Format your response in clean markdown.") || { log_error "AI analysis failed"; return 1; }
+
+    local ai_dir="$output_dir/ai_analysis"
+    mkdir -p "$ai_dir"
+    echo "$analysis" > "$ai_dir/ai_analysis.md"
+    log_ok "AI analysis saved to $ai_dir/ai_analysis.md"
+
+    # Print key findings
+    echo ""
+    echo -e "${MAGENTA}${BOLD}══════════ AI ANALYSIS ══════════${NC}"
+    echo "$analysis"
+    echo -e "${MAGENTA}${BOLD}════════════════════════════════${NC}"
+    echo ""
+}
+
+# ─── AI Adaptive Decision: recommend next steps ──────────────
+ai_decide() {
+    local output_dir="$1"
+    local current_step="${2:-0}"
+    log_section "STEP 83 — AI Adaptive Scan Decision"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && { log_info "AI disabled (use -ai to enable)"; return; }
+    ai_check || return 1
+
+    local summary_file
+    summary_file=$(ai_collect_results "$output_dir")
+
+    local scan_summary=""
+    [[ -s "$summary_file" ]] && scan_summary=$(cat "$summary_file")
+
+    local prompt="RECON FRAMEWORK - ADAPTIVE SCAN DECISION
+
+Current scan step: $current_step
+Target: $TARGET
+Scan mode: $SCAN_MODE
+
+$([ -n "$scan_summary" ] && echo "SCAN RESULTS SO FAR:
+$scan_summary" || echo "No scan results yet - this is the beginning of the scan.")
+
+Based on the results so far, decide which of the remaining scan steps to RUN or SKIP.
+Available steps and their descriptions:
+- Step 0: CDN Bypass and Origin Discovery
+- Step 1: Port Scanning
+- Step 2: ASN Mapping
+- Step 3: Subdomain Enumeration
+- Step 4: Permutation Discovery
+- Step 5: Endpoint Discovery
+- Step 6: Parameter Fuzzing
+- Step 7: Cloud Storage Discovery
+- Step 8: WAF Detection
+- Step 9: Technology Fingerprinting
+- Step 10: Directory Fuzzing
+- Step 11: DNS Enumeration
+- Step 12: HTTP Headers Analysis
+- Step 13: SSL/TLS Info
+- Step 14: OSINT and Email Harvesting
+- Step 15-16: Nuclei Vulnerability Scanning
+- Step 17: XSS Scanning
+- Step 18: OOB/SSRF Detection
+- Step 19: Injection Testing Chain
+- Step 20: CMS Testing (WordPress)
+- Step 21: Logic and Access-Control
+- Step 22: Secrets Detection
+- Step 23: HTML Injection
+- Step 24-32: Various security checks
+- Step 33-50: Advanced checks (CSV injection, SSTI, XXE, NoSQL, CSP, etc.)
+- Step 51-82: OWASP Top 10 coverage
+- Step 83: Blind SQLi via OOB
+
+Respond with EXACTLY this JSON format:
+{
+  \"run\": [list of step numbers to run],
+  \"skip\": [list of step numbers to skip],
+  \"reason\": \"brief explanation of your decision\",
+  \"priority\": \"high/medium/low - overall risk assessment\",
+  \"focus_areas\": [\"area1\", \"area2\"]
+}"
+
+    local decision
+    decision=$(ai_query "$prompt" \
+"You are an expert recon analyst. Make efficient scan decisions.
+Only recommend steps that are RELEVANT based on what you see.
+If no results yet, recommend the most efficient order for initial recon.
+Always respond with valid JSON only.") || { log_error "AI decision failed"; return 1; }
+
+    local ai_dir="$output_dir/ai_analysis"
+    mkdir -p "$ai_dir"
+    echo "$decision" > "$ai_dir/ai_decision.json"
+
+    # Parse and display decision
+    local run_steps skip_steps reason priority
+    run_steps=$(echo "$decision" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(','.join(str(x) for x in d.get('run', [])))
+except: print('')
+" 2>/dev/null)
+
+    skip_steps=$(echo "$decision" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(','.join(str(x) for x in d.get('skip', [])))
+except: print('')
+" 2>/dev/null)
+
+    reason=$(echo "$decision" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('reason', 'No reason provided'))
+except: print('')
+" 2>/dev/null)
+
+    priority=$(echo "$decision" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('priority', 'unknown'))
+except: print('')
+" 2>/dev/null)
+
+    echo ""
+    echo -e "${MAGENTA}${BOLD}══════════ AI SCAN DECISION ══════════${NC}"
+    echo -e "${CYAN}Priority: ${BOLD}$priority${NC}"
+    echo -e "${CYAN}Reason: $reason${NC}"
+    [[ -n "$run_steps" ]] && echo -e "${GREEN}Run steps: $run_steps${NC}"
+    [[ -n "$skip_steps" ]] && echo -e "${YELLOW}Skip steps: $skip_steps${NC}"
+    echo -e "${MAGENTA}${BOLD}══════════════════════════════════════${NC}"
+    echo ""
+
+    log_ok "AI decision saved to $ai_dir/ai_decision.json"
+
+    # Export for caller to use
+    AI_RUN_STEPS="$run_steps"
+    AI_SKIP_STEPS="$skip_steps"
+}
+
+# ─── AI Report Generation ────────────────────────────────────
+ai_report() {
+    local output_dir="$1"
+    log_section "AI Report Generation"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && { log_info "AI disabled (use -ai to enable)"; return; }
+    ai_check || return 1
+
+    local summary_file
+    summary_file=$(ai_collect_results "$output_dir")
+
+    [[ ! -s "$summary_file" ]] && { log_warn "No scan results for report"; return; }
+
+    local scan_summary
+    scan_summary=$(cat "$summary_file")
+
+    # Include AI analysis if available
+    local prev_analysis=""
+    [[ -s "$output_dir/ai_analysis/ai_analysis.md" ]] && prev_analysis=$(cat "$output_dir/ai_analysis/ai_analysis.md")
+
+    log_info "Generating AI-powered pentest report..."
+
+    local report
+    report=$(ai_query "$scan_summary
+
+$([ -n "$prev_analysis" ] && echo "PREVIOUS AI ANALYSIS:
+$prev_analysis" || echo "")" \
+"You are a senior penetration tester writing a professional security assessment report.
+Generate a comprehensive pentest report in markdown format with these sections:
+
+# Security Assessment Report
+
+## 1. Executive Summary
+Brief overview for management - key risks in plain language.
+
+## 2. Scope and Methodology
+What was tested, how it was tested.
+
+## 3. Findings Summary
+Table of all findings with severity and confidence.
+
+## 4. Critical Findings
+Detailed analysis of critical/high findings with:
+- Description
+- Impact
+- Evidence (reference actual scan results)
+- CVSS score estimate
+- Remediation steps
+
+## 5. Medium and Low Findings
+Grouped analysis of medium and low severity issues.
+
+## 6. Informational Findings
+Non-vulnerability observations.
+
+## 7. Attack Surface Analysis
+What an attacker would target.
+
+## 8. Recommendations
+Prioritized remediation roadmap.
+
+## 9. Appendix
+Technical details.
+
+Use actual data from the scan results. Be specific with URLs, endpoints, and evidence.
+If data is insufficient for a section, note what additional testing would be needed.") || { log_error "AI report generation failed"; return 1; }
+
+    local ai_dir="$output_dir/ai_analysis"
+    mkdir -p "$ai_dir"
+    echo "$report" > "$ai_dir/ai_report.md"
+    log_ok "AI report saved to $ai_dir/ai_report.md"
+
+    echo ""
+    echo -e "${MAGENTA}${BOLD}══════════ AI REPORT ══════════${NC}"
+    echo "$report"
+    echo -e "${MAGENTA}${BOLD}═══════════════════════════════${NC}"
+    echo ""
+}
+
+# ─── Natural Language Q&A ────────────────────────────────────
+ai_nlq() {
+    local output_dir="$1"
+    local question="$2"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && { log_info "AI disabled (use -ai to enable)"; return 1; }
+    ai_check || return 1
+
+    local summary_file
+    summary_file=$(ai_collect_results "$output_dir")
+
+    local scan_summary=""
+    [[ -s "$summary_file" ]] && scan_summary=$(cat "$summary_file")
+
+    local prev_analysis=""
+    [[ -s "$output_dir/ai_analysis/ai_analysis.md" ]] && prev_analysis=$(cat "$output_dir/ai_analysis/ai_analysis.md")
+
+    local response
+    response=$(ai_query "$question
+
+SCAN RESULTS:
+$scan_summary
+
+PREVIOUS ANALYSIS:
+$prev_analysis" \
+"You are an expert penetration tester answering questions about scan results.
+Be specific, reference actual findings, and provide actionable advice.
+If the question is about something not in the results, say so clearly.") || { log_error "AI query failed"; return 1; }
+
+    echo "$response"
+}
+
+# ─── AI Summary for notifications ────────────────────────────
+ai_quick_summary() {
+    local output_dir="$1"
+
+    [[ "$AI_ENABLED" -ne 1 ]] && return
+    [[ ! -s "$output_dir/findings.jsonl" ]] && return
+
+    local findings
+    findings=$(python3 -c "
+import json
+counts = {}
+sev = {}
+for line in open('$output_dir/findings.jsonl'):
+    line = line.strip()
+    if not line: continue
+    try:
+        r = json.loads(line)
+        c = r.get('confidence','INFO')
+        s = r.get('severity','unknown')
+        counts[c] = counts.get(c, 0) + 1
+        sev[s] = sev.get(s, 0) + 1
+    except: pass
+print(f'Confidence: {counts}')
+print(f'Severity: {sev}')
+" 2>/dev/null || echo "No findings data")
+
+    ai_query "Quick summary of this recon scan for $TARGET:
+$findings
+
+Give a 2-3 sentence executive summary." \
+"You are a security analyst providing a brief scan summary." 2>/dev/null || true
+}
